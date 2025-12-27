@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poi-visit-aggregator"
+dynamic = ["version"]
+description = "Two-stage aggregator for user POI stay data."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "pyarrow>=10",
+  "psutil>=5.9",
+  "tqdm>=4.65",
+]
+
+[tool.setuptools]
+packages = ["poi_visit_aggregator"]
+license-files = ["LICENSE"]
+
+[tool.setuptools.dynamic]
+version = { attr = "poi_visit_aggregator.aggregator.__version__" }
+
