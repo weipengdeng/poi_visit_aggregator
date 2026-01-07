@@ -517,7 +517,7 @@ def _load_poi_food_set(
         cat_col = _require_col("poi_meta.category", cat_col)
         df = t.select([poi_id_col, cat_col]).to_pandas()
     else:
-        df = pd.read_csv(poi_meta_path)
+        df = pd.read_csv(poi_meta_path, on_bad_lines="skip")
         poi_id_col = poi_map.get("poi_id") or ("poi_id" if "poi_id" in df.columns else None)
         cat_col = poi_map.get("category") or next((c for c in df.columns if "category" in c.lower() or "type" in c.lower()), None)
         poi_id_col = _require_col("poi_meta.poi_id", poi_id_col)
@@ -1133,7 +1133,7 @@ def export_user_grid_time(
             keep_cols = list(dict.fromkeys([uuid_c] + ses_keep + coord_cols))
             udf = ut.select(keep_cols).to_pandas()
         else:
-            udf = pd.read_csv(uuid_table)
+            udf = pd.read_csv(uuid_table, on_bad_lines="skip")
             uuid_c = uuid_schema_map.get("uuid") or ("uuid" if "uuid" in udf.columns else None)
             uuid_c = _require_col("uuid_table.uuid", uuid_c)
             ses_cols = uuid_schema_map.get("ses_cols")

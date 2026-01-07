@@ -156,14 +156,16 @@ def _load_uuid_whitelist_uid64(
 ) -> np.ndarray:
     uuid_schema_map = schema_map.get("uuid_table", {})
     if uuid_table.suffix.lower() == ".parquet":
-        t = pq.read_table(_as_posix(uuid_table))
-        uuid_c = uuid_schema_map.get("uuid") or _infer_col(t.schema, ["uuid", "user", "uid"])
+        schema = pq.read_schema(_as_posix(uuid_table))
+        uuid_c = uuid_schema_map.get("uuid") or _infer_col(schema, ["uuid", "user", "uid"])
         uuid_c = _require_col("uuid_table.uuid", uuid_c)
-        uuids = t.column(uuid_c).to_pandas().astype(str).to_numpy()
+        t = pq.read_table(_as_posix(uuid_table), columns=[uuid_c])
+        uuids = t.column(0).to_pandas().astype(str).to_numpy()
     else:
-        df = pd.read_csv(uuid_table)
-        uuid_c = uuid_schema_map.get("uuid") or ("uuid" if "uuid" in df.columns else None)
+        header = pd.read_csv(uuid_table, nrows=0, on_bad_lines="skip")
+        uuid_c = uuid_schema_map.get("uuid") or ("uuid" if "uuid" in header.columns else None)
         uuid_c = _require_col("uuid_table.uuid", uuid_c)
+        df = pd.read_csv(uuid_table, usecols=[uuid_c], dtype={uuid_c: "string"}, on_bad_lines="skip")
         uuids = df[uuid_c].astype(str).to_numpy()
 
     with _step(log, f"Hash uuid whitelist ({len(uuids):,})"):
