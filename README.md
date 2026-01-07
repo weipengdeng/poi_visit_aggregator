@@ -76,5 +76,64 @@ Final parquet columns (schema you can build on):
 - Tops (stored as JSON strings; use `read_result(...)` to parse): `top_enter_hours`, `top_leave_hours`, `top_weekdays`
 - Custom comparison stats (stored as JSON strings; empty `{}` unless `rhythm_specs` provided): `enter_period_stats`, `leave_period_stats`, `weekday_group_stats`, `date_group_stats`
 
+## Remote export: user_grid_time (口径A)
+
+This repo also provides a remote-friendly exporter that **does not require** any `grid_access` (exposure) data.
+It only needs a non-sensitive `grid_meta_<city>.json` to map coordinates to `grid_id`.
+By default it outputs `grid_uid = "grid_<code>_<col>_<row>"` (set `<code>` via `--grid_uid_code` or a `code/adcode` field in `grid_meta_<city>.json`) to avoid cross-city id conflicts when merging.
+In nationwide runs, this usually means **one `grid_meta_<city>.json` per city** (because origin/extent differ by city), then exporting each city separately and merging by `grid_uid`.
+
+Install with optional deps:
+
+```bash
+pip install -e ".[export]"
+```
+
+Run:
+
+```bash
+python -m poi_visit_aggregator.export_user_grid_time ^
+  --city shenzhen ^
+  --staypoints "D:\\data\\staypoints_*.csv" ^
+  --poi_meta "D:\\data\\poi_meta.parquet" ^
+  --uuid_table "D:\\data\\uuid_table.parquet" ^
+  --grid_meta "D:\\data\\grid_meta_shenzhen.json" ^
+  --out_dir "D:\\out" ^
+  --grid_uid_code 4403 ^
+  --filter_city_code true ^
+  --city_code_col c_code ^
+  --windows lunch,dinner
+```
+
+## Remote export: user_grid_time (strict/fill/filled)
+
+For exposure-weight experiments, this repo also provides a **strict + filled** exporter:
+
+- Interval records (`end>start` and `>=5min`) contribute strict overlap minutes.
+- Point records (`end==start` or `<5min`) contribute midpoint-split weights, then are scaled to fill each window's missing time.
+
+Run:
+
+```bash
+python -m poi_visit_aggregator.export_user_grid_time_strict_filled ^
+  --city shenzhen ^
+  --staypoints "D:\\data\\staypoints_*.csv" ^
+  --uuid_table "D:\\data\\uuid_table.parquet" ^
+  --grid_meta "D:\\data\\grid_meta_shenzhen.json" ^
+  --out_dir "D:\\out" ^
+  --drop_uuid_not_in_table true ^
+  --grid_uid_code 4403 ^
+  --filter_city_code true ^
+  --city_code_col c_code ^
+  --id_mode uuid ^
+  --windows lunch,dinner
+```
+
+Outputs:
+- `<out_dir>/<city>/user_grid_time_strict_filled_<city>.parquet` (columns include `grid_uid`, `window`, `is_weekend`, `tau_strict_min`, `tau_fill_min`, `tau_filled_min`, and optional `grid_id`, `uuid`, `uid64`)
+- `<out_dir>/<city>/qa_summary_strict_filled_<city>.csv`
+
+Colab demo notebook: `notebooks/Shenzhen_demo.ipynb`.
+
 ## License
 This project is licensed under the Apache License 2.0.

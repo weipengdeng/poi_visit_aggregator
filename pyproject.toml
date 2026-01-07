@@ -17,10 +17,16 @@ dependencies = [
   "tqdm>=4.65",
 ]
 
+[project.optional-dependencies]
+export = [
+  "duckdb>=0.9",
+  "pyproj>=3.5",
+  "xxhash>=3.0",
+]
+
 [tool.setuptools]
 packages = ["poi_visit_aggregator"]
 license-files = ["LICENSE"]
 
 [tool.setuptools.dynamic]
 version = { attr = "poi_visit_aggregator.aggregator.__version__" }
-
