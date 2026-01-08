@@ -954,8 +954,14 @@ def _run_stage2_and_write(
               SUM(
                 GREATEST(
                   0,
-                  LEAST(day*{MS_PER_DAY} + end_mod_ms, COALESCE((t_ms + next_t)/2, day*{MS_PER_DAY} + end_mod_ms))
-                  - GREATEST(day*{MS_PER_DAY} + start_mod_ms, COALESCE((prev_t + t_ms)/2, day*{MS_PER_DAY} + start_mod_ms))
+                  LEAST(
+                    day::BIGINT*{MS_PER_DAY} + end_mod_ms,
+                    COALESCE((t_ms + next_t)/2, day::BIGINT*{MS_PER_DAY} + end_mod_ms)
+                  )
+                  - GREATEST(
+                    day::BIGINT*{MS_PER_DAY} + start_mod_ms,
+                    COALESCE((prev_t + t_ms)/2, day::BIGINT*{MS_PER_DAY} + start_mod_ms)
+                  )
                 )::DOUBLE / {MS_PER_MIN}
               ) AS tau_point_min
             FROM point_ordered
@@ -1139,8 +1145,8 @@ def _run_stage2_and_write(
               d."window" AS window,
               GREATEST(
                 COALESCE(d.max_diff, 0),
-                COALESCE(d.first_t - (d.day*{MS_PER_DAY} + m.start_mod_ms), 0),
-                COALESCE((d.day*{MS_PER_DAY} + m.end_mod_ms) - d.last_t, 0)
+                COALESCE(d.first_t - (d.day::BIGINT*{MS_PER_DAY} + m.start_mod_ms), 0),
+                COALESCE((d.day::BIGINT*{MS_PER_DAY} + m.end_mod_ms) - d.last_t, 0)
               )::DOUBLE / {MS_PER_MIN} AS point_max_gap_min
             FROM diffs d
             JOIN window_meta m USING ("window")
