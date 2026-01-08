@@ -209,7 +209,9 @@ def export_user_grid_time_strict_filled(
     oob_mode: str,
     threads: int,
     memory_limit: str,
+    duckdb_temp_dir: Optional[Path] = None,
     id_mode: str,
+    resume_stage2: bool = False,
     keep_intermediate: bool,
 ) -> None:
     del buckets  # reserved
@@ -237,7 +239,7 @@ def export_user_grid_time_strict_filled(
     epoch_unit_n = epoch_unit.strip().lower()
     if epoch_unit_n not in {"ms", "s"}:
         raise ValueError("--epoch_unit must be ms or s")
-    if drop_uuid_not_in_table and not uuid_table:
+    if drop_uuid_not_in_table and not uuid_table and not resume_stage2:
         raise ValueError("--uuid_table is required when drop_uuid_not_in_table=true")
 
     log("=" * 70)
@@ -361,7 +363,7 @@ def export_user_grid_time_strict_filled(
     point_parts_dir = tmp_dir / "point_parts"
     interval_parts_dir.mkdir(parents=True, exist_ok=True)
     point_parts_dir.mkdir(parents=True, exist_ok=True)
-    if not keep_intermediate:
+    if not keep_intermediate and not resume_stage2:
         with _step(log, "Clean intermediate parts"):
             for p in list(interval_parts_dir.glob("part_*.parquet")) + list(point_parts_dir.glob("part_*.parquet")):
                 p.unlink()
@@ -396,9 +398,51 @@ def export_user_grid_time_strict_filled(
         "point_rows_outside_windows": 0,
         "interval_cross_day_rows": 0,
         "interval_multi_day_rows_dropped": 0,
+        "resume_stage2": bool(resume_stage2),
     }
 
     point_source_value_l = point_source_value.strip().lower()
+
+    out_path = city_dir / f"user_grid_time_strict_filled_{city}.parquet"
+    qa_path = city_dir / f"qa_summary_strict_filled_{city}.csv"
+
+    if resume_stage2:
+        interval_files = list(interval_parts_dir.glob("part_*.parquet"))
+        point_files = list(point_parts_dir.glob("part_*.parquet"))
+        qa["resume_interval_parts"] = len(interval_files)
+        qa["resume_point_parts"] = len(point_files)
+        if not interval_files and not point_files:
+            raise ValueError(
+                "resume_stage2=true but no intermediate parts found. "
+                f"Expected files under: {interval_parts_dir} and/or {point_parts_dir}. "
+                "Run once with resume_stage2=false to generate them."
+            )
+        log(f"Resume Stage-2 from existing parts: interval_parts={len(interval_files):,}, point_parts={len(point_files):,}")
+        _run_stage2_and_write(
+            city=city,
+            city_dir=city_dir,
+            tmp_dir=tmp_dir,
+            duckdb_temp_dir=duckdb_temp_dir,
+            interval_parts_dir=interval_parts_dir,
+            point_parts_dir=point_parts_dir,
+            out_path=out_path,
+            qa=qa,
+            qa_path=qa_path,
+            window_meta_df=window_meta_df,
+            output_grid_uid=output_grid_uid,
+            output_grid_id=output_grid_id,
+            grid_n_cols=grid_meta.n_cols,
+            grid_uid_prefix=grid_uid_prefix_n,
+            grid_uid_code=grid_uid_code_n,
+            grid_uid_order=grid_uid_order_n,
+            store_uuid=store_uuid,
+            store_uid64=store_uid64,
+            threads=threads,
+            memory_limit=memory_limit,
+            keep_intermediate=keep_intermediate,
+            log=log,
+        )
+        return
 
     filter_expr = None
     if filter_city_code:
@@ -436,268 +480,267 @@ def export_user_grid_time_strict_filled(
     part_id = 0
     batch_i = 0
 
-    with _step(log, "Stage-1 scan + write parts"):
-        for batch in scanner.to_batches():
-            batch_i += 1
-            n = batch.num_rows
-            qa["input_rows"] += n
-            if n == 0:
-                continue
-
-            uuid_vals = _col_as_str(batch.column(uuid_col))
-            start_ms = _col_as_int64(batch.column(start_col))
-            end_ms = _col_as_int64(batch.column(end_col))
-
-            if epoch_unit_n == "s":
-                start_ms = start_ms * 1000
-                end_ms = end_ms * 1000
-            if timestamps_are_utc:
-                start_ms = start_ms + tz_offset_ms
-                end_ms = end_ms + tz_offset_ms
-
-            valid_time = (start_ms >= 0) & (end_ms >= start_ms)
-            qa["invalid_time_rows"] += int((~valid_time).sum())
-            mask = valid_time & (uuid_vals != "")
-            if not mask.any():
-                continue
-
-            idx = np.nonzero(mask)[0]
-            uuid_keep = uuid_vals[idx]
-            uid64_keep = _hash_uuid(uuid_keep, uid64_hash_method)
-
-            if whitelist_uid64_sorted is not None:
-                before = len(idx)
-                in_tbl = _mask_in_sorted_uint64(uid64_keep, whitelist_uid64_sorted)
-                qa["filtered_uuid_not_in_table"] += before - int(in_tbl.sum())
-                idx = idx[in_tbl]
-                uuid_keep = uuid_keep[in_tbl]
-                uid64_keep = uid64_keep[in_tbl]
-                if len(idx) == 0:
+    if not resume_stage2:
+        with _step(log, "Stage-1 scan + write parts"):
+            for batch in scanner.to_batches():
+                batch_i += 1
+                n = batch.num_rows
+                qa["input_rows"] += n
+                if n == 0:
                     continue
 
-            if coord_mode == "xy":
-                x = _col_as_float64(batch.column(x_col))[idx]  # type: ignore[arg-type]
-                y = _col_as_float64(batch.column(y_col))[idx]  # type: ignore[arg-type]
-            elif coord_mode == "lonlat":
-                lon = _col_as_float64(batch.column(lon_col))[idx]  # type: ignore[arg-type]
-                lat = _col_as_float64(batch.column(lat_col))[idx]  # type: ignore[arg-type]
-                x, y = transformer.transform(lon, lat)  # type: ignore[union-attr]
-                x = np.asarray(x, dtype=np.float64)
-                y = np.asarray(y, dtype=np.float64)
-            else:
-                lon, lat = _parse_location_to_lonlat(batch.column(loc_col))  # type: ignore[arg-type]
-                lon = lon[idx]
-                lat = lat[idx]
-                x, y = transformer.transform(lon, lat)  # type: ignore[union-attr]
-                x = np.asarray(x, dtype=np.float64)
-                y = np.asarray(y, dtype=np.float64)
+                uuid_vals = _col_as_str(batch.column(uuid_col))
+                start_ms = _col_as_int64(batch.column(start_col))
+                end_ms = _col_as_int64(batch.column(end_col))
 
-            grid_id_raw, oob_mask = _map_xy_to_grid_id(x, y, grid_meta, oob_mode=oob_mode)
-            if oob_mode.lower() == "drop":
-                before = len(grid_id_raw)
-                keep = ~oob_mask
-                qa["filtered_oob_grid"] += before - int(keep.sum())
-                grid_id_raw = grid_id_raw[keep]
-                idx = idx[keep]
-                uuid_keep = uuid_keep[keep]
-                uid64_keep = uid64_keep[keep]
-                if len(idx) == 0:
+                if epoch_unit_n == "s":
+                    start_ms = start_ms * 1000
+                    end_ms = end_ms * 1000
+                if timestamps_are_utc:
+                    start_ms = start_ms + tz_offset_ms
+                    end_ms = end_ms + tz_offset_ms
+
+                valid_time = (start_ms >= 0) & (end_ms >= start_ms)
+                qa["invalid_time_rows"] += int((~valid_time).sum())
+                mask = valid_time & (uuid_vals != "")
+                if not mask.any():
                     continue
-            else:
-                qa["filtered_oob_grid"] += int(oob_mask.sum())
 
-            start_ms_f = start_ms[idx]
-            end_ms_f = end_ms[idx]
-            qa["kept_rows"] += len(idx)
+                idx = np.nonzero(mask)[0]
+                uuid_keep = uuid_vals[idx]
+                uid64_keep = _hash_uuid(uuid_keep, uid64_hash_method)
 
-            grid_id_i32 = grid_id_raw.astype(np.int32, copy=False)
-            dur_ms = (end_ms_f - start_ms_f).astype(np.int64, copy=False)
-            is_interval = (dur_ms > 0) & (dur_ms >= int(min_interval_minutes) * MS_PER_MIN)
-            is_point = ~is_interval
-            qa["interval_rows"] += int(is_interval.sum())
-            qa["point_rows"] += int(is_point.sum())
+                if whitelist_uid64_sorted is not None:
+                    before = len(idx)
+                    in_tbl = _mask_in_sorted_uint64(uid64_keep, whitelist_uid64_sorted)
+                    qa["filtered_uuid_not_in_table"] += before - int(in_tbl.sum())
+                    idx = idx[in_tbl]
+                    uuid_keep = uuid_keep[in_tbl]
+                    uid64_keep = uid64_keep[in_tbl]
+                    if len(idx) == 0:
+                        continue
 
-            part_id += 1
+                if coord_mode == "xy":
+                    x = _col_as_float64(batch.column(x_col))[idx]  # type: ignore[arg-type]
+                    y = _col_as_float64(batch.column(y_col))[idx]  # type: ignore[arg-type]
+                elif coord_mode == "lonlat":
+                    lon = _col_as_float64(batch.column(lon_col))[idx]  # type: ignore[arg-type]
+                    lat = _col_as_float64(batch.column(lat_col))[idx]  # type: ignore[arg-type]
+                    x, y = transformer.transform(lon, lat)  # type: ignore[union-attr]
+                    x = np.asarray(x, dtype=np.float64)
+                    y = np.asarray(y, dtype=np.float64)
+                else:
+                    lon, lat = _parse_location_to_lonlat(batch.column(loc_col))  # type: ignore[arg-type]
+                    lon = lon[idx]
+                    lat = lat[idx]
+                    x, y = transformer.transform(lon, lat)  # type: ignore[union-attr]
+                    x = np.asarray(x, dtype=np.float64)
+                    y = np.asarray(y, dtype=np.float64)
 
-            interval_rows_out = 0
-            point_rows_out = 0
+                grid_id_raw, oob_mask = _map_xy_to_grid_id(x, y, grid_meta, oob_mode=oob_mode)
+                if oob_mode.lower() == "drop":
+                    before = len(grid_id_raw)
+                    keep = ~oob_mask
+                    qa["filtered_oob_grid"] += before - int(keep.sum())
+                    grid_id_raw = grid_id_raw[keep]
+                    idx = idx[keep]
+                    uuid_keep = uuid_keep[keep]
+                    uid64_keep = uid64_keep[keep]
+                    if len(idx) == 0:
+                        continue
+                else:
+                    qa["filtered_oob_grid"] += int(oob_mask.sum())
 
-            # ---- interval: compute tau_strict_min ----
-            if is_interval.any():
-                int_idx = np.nonzero(is_interval)[0]
-                int_start = start_ms_f[int_idx]
-                int_end = end_ms_f[int_idx]
-                day0 = (int_start // MS_PER_DAY).astype(np.int64)
-                day1 = ((int_end - 1) // MS_PER_DAY).astype(np.int64)
-                same_day = day1 == day0
-                cross_1 = day1 == (day0 + 1)
-                multi_day = day1 > (day0 + 1)
-                qa["interval_cross_day_rows"] += int(cross_1.sum())
-                qa["interval_multi_day_rows_dropped"] += int(multi_day.sum())
+                start_ms_f = start_ms[idx]
+                end_ms_f = end_ms[idx]
+                qa["kept_rows"] += len(idx)
 
-                seg_uid64 = []
-                seg_uuid = []
-                seg_grid = []
-                seg_day = []
-                seg_start = []
-                seg_end = []
+                grid_id_i32 = grid_id_raw.astype(np.int32, copy=False)
+                dur_ms = (end_ms_f - start_ms_f).astype(np.int64, copy=False)
+                is_interval = (dur_ms > 0) & (dur_ms >= int(min_interval_minutes) * MS_PER_MIN)
+                is_point = ~is_interval
+                qa["interval_rows"] += int(is_interval.sum())
+                qa["point_rows"] += int(is_point.sum())
 
-                if same_day.any():
-                    j = int_idx[same_day]
-                    seg_uid64.append(uid64_keep[j])
-                    seg_uuid.append(uuid_keep[j])
-                    seg_grid.append(grid_id_i32[j])
-                    seg_day.append(day0[same_day].astype(np.int32))
-                    seg_start.append(int_start[same_day])
-                    seg_end.append(int_end[same_day])
+                part_id += 1
 
-                if cross_1.any():
-                    j = int_idx[cross_1]
-                    d0 = day0[cross_1]
-                    d1 = day1[cross_1]
-                    d0_end = (d0 + 1) * MS_PER_DAY
-                    d1_start = d1 * MS_PER_DAY
-                    seg_uid64.append(uid64_keep[j])
-                    seg_uuid.append(uuid_keep[j])
-                    seg_grid.append(grid_id_i32[j])
-                    seg_day.append(d0.astype(np.int32))
-                    seg_start.append(int_start[cross_1])
-                    seg_end.append(d0_end.astype(np.int64))
-                    seg_uid64.append(uid64_keep[j])
-                    seg_uuid.append(uuid_keep[j])
-                    seg_grid.append(grid_id_i32[j])
-                    seg_day.append(d1.astype(np.int32))
-                    seg_start.append(d1_start.astype(np.int64))
-                    seg_end.append(int_end[cross_1])
+                interval_rows_out = 0
+                point_rows_out = 0
 
-                if seg_uid64:
-                    s_uid64 = np.concatenate(seg_uid64).astype(np.uint64, copy=False)
-                    s_uuid = np.concatenate(seg_uuid).astype(object, copy=False)
-                    s_grid = np.concatenate(seg_grid).astype(np.int32, copy=False)
-                    s_day = np.concatenate(seg_day).astype(np.int32, copy=False)
-                    s_start = np.concatenate(seg_start).astype(np.int64, copy=False)
-                    s_end = np.concatenate(seg_end).astype(np.int64, copy=False)
+                # ---- interval: compute tau_strict_min ----
+                if is_interval.any():
+                    int_idx = np.nonzero(is_interval)[0]
+                    int_start = start_ms_f[int_idx]
+                    int_end = end_ms_f[int_idx]
+                    day0 = (int_start // MS_PER_DAY).astype(np.int64)
+                    day1 = ((int_end - 1) // MS_PER_DAY).astype(np.int64)
+                    same_day = day1 == day0
+                    cross_1 = day1 == (day0 + 1)
+                    multi_day = day1 > (day0 + 1)
+                    qa["interval_cross_day_rows"] += int(cross_1.sum())
+                    qa["interval_multi_day_rows_dropped"] += int(multi_day.sum())
 
-                    out_uid64 = []
-                    out_uuid = []
-                    out_grid = []
-                    out_day = []
-                    out_wkend = []
-                    out_win = []
-                    out_tau = []
+                    seg_uid64 = []
+                    seg_uuid = []
+                    seg_grid = []
+                    seg_day = []
+                    seg_start = []
+                    seg_end = []
 
-                    for wname, spec in window_specs.items():
-                        tau = _compute_window_overlap_minutes(s_start, s_end, spec, rounding=overlap_rounding)
-                        ok = tau > 0
-                        if not ok.any():
-                            continue
-                        out_uid64.append(s_uid64[ok])
-                        out_uuid.append(s_uuid[ok])
-                        out_grid.append(s_grid[ok])
-                        out_day.append(s_day[ok])
-                        out_wkend.append(_is_weekend_from_epoch_day(s_day[ok].astype(np.int64)).astype(bool))
-                        out_win.append(np.full(int(ok.sum()), wname, dtype=object))
-                        out_tau.append(tau[ok].astype(np.int32, copy=False))
+                    if same_day.any():
+                        j = int_idx[same_day]
+                        seg_uid64.append(uid64_keep[j])
+                        seg_uuid.append(uuid_keep[j])
+                        seg_grid.append(grid_id_i32[j])
+                        seg_day.append(day0[same_day].astype(np.int32))
+                        seg_start.append(int_start[same_day])
+                        seg_end.append(int_end[same_day])
 
-                    if out_uid64:
-                        t_uid64 = np.concatenate(out_uid64)
-                        t = pa.table(
-                            {
-                                "uid64": pa.array(t_uid64, type=pa.uint64()),
-                                "grid_id": pa.array(np.concatenate(out_grid), type=pa.int32()),
-                                "day": pa.array(np.concatenate(out_day), type=pa.int32()),
-                                "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
-                                "window": pa.array(np.concatenate(out_win), type=pa.string()),
-                                "tau_strict_min": pa.array(np.concatenate(out_tau), type=pa.int32()),
-                            }
-                        )
-                        if store_uuid:
-                            t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
-                        _write_table_zstd(t, interval_parts_dir / f"part_{part_id:06d}.parquet")
-                        interval_rows_out = t.num_rows
+                    if cross_1.any():
+                        j = int_idx[cross_1]
+                        d0 = day0[cross_1]
+                        d1 = day1[cross_1]
+                        d0_end = (d0 + 1) * MS_PER_DAY
+                        d1_start = d1 * MS_PER_DAY
+                        seg_uid64.append(uid64_keep[j])
+                        seg_uuid.append(uuid_keep[j])
+                        seg_grid.append(grid_id_i32[j])
+                        seg_day.append(d0.astype(np.int32))
+                        seg_start.append(int_start[cross_1])
+                        seg_end.append(d0_end.astype(np.int64))
+                        seg_uid64.append(uid64_keep[j])
+                        seg_uuid.append(uuid_keep[j])
+                        seg_grid.append(grid_id_i32[j])
+                        seg_day.append(d1.astype(np.int32))
+                        seg_start.append(d1_start.astype(np.int64))
+                        seg_end.append(int_end[cross_1])
 
-            # ---- point: write t_ms for midpoint split ----
-            if is_point.any():
-                p_idx = np.nonzero(is_point)[0]
-                p_uid64 = uid64_keep[p_idx]
-                p_uuid = uuid_keep[p_idx]
-                p_grid = grid_id_i32[p_idx]
-                p_start = start_ms_f[p_idx]
-                p_end = end_ms_f[p_idx]
-                p_mid = ((p_start.astype(np.int64) + p_end.astype(np.int64)) // 2).astype(np.int64)
+                    if seg_uid64:
+                        s_uid64 = np.concatenate(seg_uid64).astype(np.uint64, copy=False)
+                        s_uuid = np.concatenate(seg_uuid).astype(object, copy=False)
+                        s_grid = np.concatenate(seg_grid).astype(np.int32, copy=False)
+                        s_day = np.concatenate(seg_day).astype(np.int32, copy=False)
+                        s_start = np.concatenate(seg_start).astype(np.int64, copy=False)
+                        s_end = np.concatenate(seg_end).astype(np.int64, copy=False)
 
-                use_mask = np.ones(len(p_idx), dtype=bool)
-                if point_source_filter:
-                    if source_col and source_col in batch.schema.names:
-                        src_vals = _col_as_str(batch.column(source_col))[idx][p_idx]  # type: ignore[arg-type]
-                        src_vals = np.asarray(src_vals, dtype=str)
-                        use_mask &= np.char.lower(src_vals) == point_source_value_l
-                    else:
-                        log("WARN: point_source_filter=true but `source` column not found; using all point rows.")
-                qa["point_rows_used"] += int(use_mask.sum())
-                if use_mask.any():
-                    p_uid64 = p_uid64[use_mask]
-                    p_uuid = p_uuid[use_mask]
-                    p_grid = p_grid[use_mask]
-                    p_mid = p_mid[use_mask]
+                        out_uid64 = []
+                        out_uuid = []
+                        out_grid = []
+                        out_day = []
+                        out_wkend = []
+                        out_win = []
+                        out_tau = []
 
-                    p_day = (p_mid // MS_PER_DAY).astype(np.int64)
-                    p_mod = (p_mid - p_day * MS_PER_DAY).astype(np.int64)
-                    p_wkend = _is_weekend_from_epoch_day(p_day).astype(bool)
+                        for wname, spec in window_specs.items():
+                            tau = _compute_window_overlap_minutes(s_start, s_end, spec, rounding=overlap_rounding)
+                            ok = tau > 0
+                            if not ok.any():
+                                continue
+                            out_uid64.append(s_uid64[ok])
+                            out_uuid.append(s_uuid[ok])
+                            out_grid.append(s_grid[ok])
+                            out_day.append(s_day[ok])
+                            out_wkend.append(_is_weekend_from_epoch_day(s_day[ok].astype(np.int64)).astype(bool))
+                            out_win.append(np.full(int(ok.sum()), wname, dtype=object))
+                            out_tau.append(tau[ok].astype(np.int32, copy=False))
 
-                    out_uid64 = []
-                    out_uuid = []
-                    out_grid = []
-                    out_day = []
-                    out_wkend = []
-                    out_win = []
-                    out_t = []
+                        if out_uid64:
+                            t_uid64 = np.concatenate(out_uid64)
+                            t = pa.table(
+                                {
+                                    "uid64": pa.array(t_uid64, type=pa.uint64()),
+                                    "grid_id": pa.array(np.concatenate(out_grid), type=pa.int32()),
+                                    "day": pa.array(np.concatenate(out_day), type=pa.int32()),
+                                    "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
+                                    "window": pa.array(np.concatenate(out_win), type=pa.string()),
+                                    "tau_strict_min": pa.array(np.concatenate(out_tau), type=pa.int32()),
+                                }
+                            )
+                            if store_uuid:
+                                t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
+                            _write_table_zstd(t, interval_parts_dir / f"part_{part_id:06d}.parquet")
+                            interval_rows_out = t.num_rows
 
-                    in_any = np.zeros(len(p_mid), dtype=bool)
-                    for wname, spec in window_specs.items():
-                        ok = _in_window(p_mod, spec)
-                        if not ok.any():
-                            continue
-                        in_any |= ok
-                        out_uid64.append(p_uid64[ok])
-                        out_uuid.append(p_uuid[ok])
-                        out_grid.append(p_grid[ok])
-                        out_day.append(p_day[ok].astype(np.int32))
-                        out_wkend.append(p_wkend[ok])
-                        out_win.append(np.full(int(ok.sum()), wname, dtype=object))
-                        out_t.append(p_mid[ok].astype(np.int64))
+                # ---- point: write t_ms for midpoint split ----
+                if is_point.any():
+                    p_idx = np.nonzero(is_point)[0]
+                    p_uid64 = uid64_keep[p_idx]
+                    p_uuid = uuid_keep[p_idx]
+                    p_grid = grid_id_i32[p_idx]
+                    p_start = start_ms_f[p_idx]
+                    p_end = end_ms_f[p_idx]
+                    p_mid = ((p_start.astype(np.int64) + p_end.astype(np.int64)) // 2).astype(np.int64)
 
-                    qa["point_rows_outside_windows"] += int((~in_any).sum())
-                    if out_uid64:
-                        t = pa.table(
-                            {
-                                "uid64": pa.array(np.concatenate(out_uid64), type=pa.uint64()),
-                                "grid_id": pa.array(np.concatenate(out_grid), type=pa.int32()),
-                                "day": pa.array(np.concatenate(out_day), type=pa.int32()),
-                                "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
-                                "window": pa.array(np.concatenate(out_win), type=pa.string()),
-                                "t_ms": pa.array(np.concatenate(out_t), type=pa.int64()),
-                            }
-                        )
-                        if store_uuid:
-                            t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
-                        _write_table_zstd(t, point_parts_dir / f"part_{part_id:06d}.parquet")
-                        point_rows_out = t.num_rows
+                    use_mask = np.ones(len(p_idx), dtype=bool)
+                    if point_source_filter:
+                        if source_col and source_col in batch.schema.names:
+                            src_vals = _col_as_str(batch.column(source_col))[idx][p_idx]  # type: ignore[arg-type]
+                            src_vals = np.asarray(src_vals, dtype=str)
+                            use_mask &= np.char.lower(src_vals) == point_source_value_l
+                        else:
+                            log("WARN: point_source_filter=true but `source` column not found; using all point rows.")
+                    qa["point_rows_used"] += int(use_mask.sum())
+                    if use_mask.any():
+                        p_uid64 = p_uid64[use_mask]
+                        p_uuid = p_uuid[use_mask]
+                        p_grid = p_grid[use_mask]
+                        p_mid = p_mid[use_mask]
 
-            if batch_i % 50 == 0:
-                log(
-                    f"batches={batch_i:,}, input_rows={qa['input_rows']:,}, kept_rows={qa['kept_rows']:,}, "
-                    f"interval_out={interval_rows_out:,}, point_out={point_rows_out:,}"
-                )
+                        p_day = (p_mid // MS_PER_DAY).astype(np.int64)
+                        p_mod = (p_mid - p_day * MS_PER_DAY).astype(np.int64)
+                        p_wkend = _is_weekend_from_epoch_day(p_day).astype(bool)
 
-    out_path = city_dir / f"user_grid_time_strict_filled_{city}.parquet"
-    qa_path = city_dir / f"qa_summary_strict_filled_{city}.csv"
+                        out_uid64 = []
+                        out_uuid = []
+                        out_grid = []
+                        out_day = []
+                        out_wkend = []
+                        out_win = []
+                        out_t = []
+
+                        in_any = np.zeros(len(p_mid), dtype=bool)
+                        for wname, spec in window_specs.items():
+                            ok = _in_window(p_mod, spec)
+                            if not ok.any():
+                                continue
+                            in_any |= ok
+                            out_uid64.append(p_uid64[ok])
+                            out_uuid.append(p_uuid[ok])
+                            out_grid.append(p_grid[ok])
+                            out_day.append(p_day[ok].astype(np.int32))
+                            out_wkend.append(p_wkend[ok])
+                            out_win.append(np.full(int(ok.sum()), wname, dtype=object))
+                            out_t.append(p_mid[ok].astype(np.int64))
+
+                        qa["point_rows_outside_windows"] += int((~in_any).sum())
+                        if out_uid64:
+                            t = pa.table(
+                                {
+                                    "uid64": pa.array(np.concatenate(out_uid64), type=pa.uint64()),
+                                    "grid_id": pa.array(np.concatenate(out_grid), type=pa.int32()),
+                                    "day": pa.array(np.concatenate(out_day), type=pa.int32()),
+                                    "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
+                                    "window": pa.array(np.concatenate(out_win), type=pa.string()),
+                                    "t_ms": pa.array(np.concatenate(out_t), type=pa.int64()),
+                                }
+                            )
+                            if store_uuid:
+                                t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
+                            _write_table_zstd(t, point_parts_dir / f"part_{part_id:06d}.parquet")
+                            point_rows_out = t.num_rows
+
+                if batch_i % 50 == 0:
+                    log(
+                        f"batches={batch_i:,}, input_rows={qa['input_rows']:,}, kept_rows={qa['kept_rows']:,}, "
+                        f"interval_out={interval_rows_out:,}, point_out={point_rows_out:,}"
+                    )
 
     # Stage-2 + output is implemented below (added in the next patch).
     _run_stage2_and_write(
         city=city,
         city_dir=city_dir,
         tmp_dir=tmp_dir,
+        duckdb_temp_dir=duckdb_temp_dir,
         interval_parts_dir=interval_parts_dir,
         point_parts_dir=point_parts_dir,
         out_path=out_path,
@@ -724,6 +767,7 @@ def _run_stage2_and_write(
     city: str,
     city_dir: Path,
     tmp_dir: Path,
+    duckdb_temp_dir: Optional[Path],
     interval_parts_dir: Path,
     point_parts_dir: Path,
     out_path: Path,
@@ -777,7 +821,7 @@ def _run_stage2_and_write(
         return
 
     with _step(log, "Stage-2 DuckDB (midpoint split + strict/fill aggregation)"):
-        temp_dir = tmp_dir / "duckdb_tmp"
+        temp_dir = duckdb_temp_dir if duckdb_temp_dir is not None else (tmp_dir / "duckdb_tmp")
         temp_dir.mkdir(parents=True, exist_ok=True)
         con = duckdb.connect(database=":memory:")
         con.execute(f"PRAGMA threads={int(threads)}")
@@ -825,9 +869,9 @@ def _run_stage2_and_write(
         con.execute(
             """
             CREATE VIEW interval_agg AS
-            SELECT uid64, day, is_weekend, window, grid_id, CAST(SUM(tau_strict_min) AS DOUBLE) AS tau_strict_min
+            SELECT uid64, day, is_weekend, "window" AS window, grid_id, CAST(SUM(tau_strict_min) AS DOUBLE) AS tau_strict_min
             FROM interval_raw
-            GROUP BY uid64, day, is_weekend, window, grid_id
+            GROUP BY uid64, day, is_weekend, "window", grid_id
             """
         )
 
@@ -838,16 +882,16 @@ def _run_stage2_and_write(
               p.uid64,
               p.day,
               p.is_weekend,
-              p.window,
+              p."window" AS window,
               p.grid_id,
               p.t_ms,
-              LAG(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p.window ORDER BY p.t_ms) AS prev_t,
-              LEAD(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p.window ORDER BY p.t_ms) AS next_t,
+              LAG(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p."window" ORDER BY p.t_ms) AS prev_t,
+              LEAD(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p."window" ORDER BY p.t_ms) AS next_t,
               m.start_mod_ms,
               m.end_mod_ms,
               m.win_len_min
             FROM point_raw p
-            JOIN window_meta m USING (window)
+            JOIN window_meta m USING ("window")
             """
         )
 
@@ -858,7 +902,7 @@ def _run_stage2_and_write(
               uid64,
               day,
               is_weekend,
-              window,
+              "window" AS window,
               grid_id,
               SUM(
                 GREATEST(
@@ -868,7 +912,7 @@ def _run_stage2_and_write(
                 )::DOUBLE / {MS_PER_MIN}
               ) AS tau_point_min
             FROM point_ordered
-            GROUP BY uid64, day, is_weekend, window, grid_id
+            GROUP BY uid64, day, is_weekend, "window", grid_id
             """
         )
 
@@ -879,16 +923,16 @@ def _run_stage2_and_write(
               uid64,
               day,
               is_weekend,
-              window,
+              "window" AS window,
               grid_id,
               SUM(tau_strict_min) AS tau_strict_min,
               SUM(tau_point_min) AS tau_point_min
             FROM (
-              SELECT uid64, day, is_weekend, window, grid_id, tau_strict_min, 0.0 AS tau_point_min FROM interval_agg
+              SELECT uid64, day, is_weekend, "window" AS window, grid_id, tau_strict_min, 0.0 AS tau_point_min FROM interval_agg
               UNION ALL
-              SELECT uid64, day, is_weekend, window, grid_id, 0.0 AS tau_strict_min, tau_point_min FROM point_agg
+              SELECT uid64, day, is_weekend, "window" AS window, grid_id, 0.0 AS tau_strict_min, tau_point_min FROM point_agg
             ) u
-            GROUP BY uid64, day, is_weekend, window, grid_id
+            GROUP BY uid64, day, is_weekend, "window", grid_id
             """
         )
 
@@ -899,7 +943,7 @@ def _run_stage2_and_write(
               b.uid64,
               b.day,
               b.is_weekend,
-              b.window,
+              b."window" AS window,
               SUM(b.tau_strict_min) AS strict_sum_min,
               SUM(b.tau_point_min) AS point_sum_min,
               m.win_len_min,
@@ -909,8 +953,8 @@ def _run_stage2_and_write(
                 ELSE 0.0
               END AS fill_factor
             FROM base b
-            JOIN window_meta m USING (window)
-            GROUP BY b.uid64, b.day, b.is_weekend, b.window, m.win_len_min
+            JOIN window_meta m USING ("window")
+            GROUP BY b.uid64, b.day, b.is_weekend, b."window", m.win_len_min
             """
         )
 
@@ -946,7 +990,7 @@ def _run_stage2_and_write(
         if output_grid_id:
             outer_cols.append("agg.grid_id AS grid_id")
         outer_cols += [
-            "window",
+            'agg."window" AS window',
             "is_weekend",
         ]
         outer_select = ",\n                ".join(outer_cols)
@@ -962,17 +1006,17 @@ def _run_stage2_and_write(
               FROM (
                 SELECT
                   b.grid_id,
-                  b.window,
+                  b."window" AS window,
                   b.is_weekend
                   {id_select_inner},
                   CAST(SUM(b.tau_strict_min) AS INTEGER) AS tau_strict_min,
                   SUM(b.tau_point_min * f.fill_factor) AS tau_fill_min,
                   SUM(b.tau_strict_min + b.tau_point_min * f.fill_factor) AS tau_filled_min
                 FROM base b
-                JOIN factors f USING (uid64, day, is_weekend, window)
+                JOIN factors f USING (uid64, day, is_weekend, "window")
                 {id_join}
                 WHERE b.grid_id IS NOT NULL AND b.grid_id >= 0
-                GROUP BY b.grid_id, b.window, b.is_weekend{group_extra}
+                GROUP BY b.grid_id, b."window", b.is_weekend{group_extra}
               ) agg
             ) TO '{_as_posix(out_path)}' (FORMAT PARQUET, CODEC ZSTD);
             """
@@ -989,7 +1033,7 @@ def _run_stage2_and_write(
         win_stats = con.execute(
             """
             SELECT
-              window,
+              "window" AS window,
               COUNT(*) AS n_user_day_windows,
               SUM(strict_sum_min) AS strict_sum_total_min,
               SUM(point_sum_min) AS point_sum_total_min,
@@ -1002,7 +1046,7 @@ def _run_stage2_and_write(
               quantile_cont(missing_min, 0.9) AS missing_p90,
               quantile_cont(missing_min, 0.99) AS missing_p99
             FROM factors
-            GROUP BY window
+            GROUP BY "window"
             """
         ).fetchdf()
         for _, r in win_stats.iterrows():
@@ -1027,7 +1071,7 @@ def _run_stage2_and_write(
               SELECT
                 uid64,
                 day,
-                window,
+                "window" AS window,
                 MIN(t_ms) AS first_t,
                 MAX(t_ms) AS last_t,
                 MAX(t_ms - prev_t) AS max_diff
@@ -1035,36 +1079,36 @@ def _run_stage2_and_write(
                 SELECT
                   uid64,
                   day,
-                  window,
+                  "window" AS window,
                   t_ms,
-                  LAG(t_ms) OVER (PARTITION BY uid64, day, window ORDER BY t_ms) AS prev_t
+                  LAG(t_ms) OVER (PARTITION BY uid64, day, "window" ORDER BY t_ms) AS prev_t
                 FROM point_raw
               ) o
-              GROUP BY uid64, day, window
+              GROUP BY uid64, day, "window"
             )
             SELECT
               d.uid64,
               d.day,
-              d.window,
+              d."window" AS window,
               GREATEST(
                 COALESCE(d.max_diff, 0),
                 COALESCE(d.first_t - (d.day*{MS_PER_DAY} + m.start_mod_ms), 0),
                 COALESCE((d.day*{MS_PER_DAY} + m.end_mod_ms) - d.last_t, 0)
               )::DOUBLE / {MS_PER_MIN} AS point_max_gap_min
             FROM diffs d
-            JOIN window_meta m USING (window)
+            JOIN window_meta m USING ("window")
             """
         )
         gap_stats = con.execute(
             """
             SELECT
-              f.window,
+              f."window" AS window,
               quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.5) AS point_max_gap_p50,
               quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.9) AS point_max_gap_p90,
               quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.99) AS point_max_gap_p99
             FROM factors f
-            LEFT JOIN point_gap g USING (uid64, day, window)
-            GROUP BY f.window
+            LEFT JOIN point_gap g USING (uid64, day, "window")
+            GROUP BY f."window"
             """
         ).fetchdf()
         for _, r in gap_stats.iterrows():
@@ -1130,6 +1174,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--memory_limit", default="16GB")
+    p.add_argument("--duckdb_temp_dir", default=None, help="Optional DuckDB temp directory (for spills); default is <out_dir>/<city>/_tmp_strict_filled/duckdb_tmp")
+    p.add_argument("--resume_stage2", type=_str2bool, default=False, help="If true, skip Stage-1 scan and reuse existing _tmp_strict_filled parts")
     p.add_argument("--keep_intermediate", type=_str2bool, default=False)
     return p
 
@@ -1145,6 +1191,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     uuid_table = Path(args.uuid_table).resolve() if args.uuid_table else None
     grid_meta_path = Path(args.grid_meta).resolve()
     out_dir = Path(args.out_dir).resolve()
+    duckdb_temp_dir = Path(args.duckdb_temp_dir).resolve() if args.duckdb_temp_dir else None
 
     windows = [w.strip() for w in args.windows.split(",") if w.strip()]
 
@@ -1180,7 +1227,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         oob_mode=args.oob_mode,
         threads=args.threads,
         memory_limit=args.memory_limit,
+        duckdb_temp_dir=duckdb_temp_dir,
         id_mode=args.id_mode,
+        resume_stage2=args.resume_stage2,
         keep_intermediate=args.keep_intermediate,
     )
 
