@@ -121,10 +121,13 @@ python -m poi_visit_aggregator.export_user_grid_time_strict_filled ^
   --uuid_table "D:\\data\\uuid_table.parquet" ^
   --grid_meta "D:\\data\\grid_meta_shenzhen.json" ^
   --out_dir "D:\\out" ^
+  --tmp_root "D:\\tmp\\poi_visit_tmp" ^
   --drop_uuid_not_in_table true ^
   --grid_uid_code 4403 ^
   --filter_city_code true ^
   --city_code_col c_code ^
+  --duckdb_temp_dir "D:\\tmp\\duckdb_tmp" ^
+  --resume_stage2 false ^
   --id_mode uuid ^
   --windows lunch,dinner
 ```
@@ -133,7 +136,7 @@ Outputs:
 - `<out_dir>/<city>/user_grid_time_strict_filled_<city>.parquet` (columns include `grid_uid`, `window`, `is_weekend`, `tau_strict_min`, `tau_fill_min`, `tau_filled_min`, and optional `grid_id`, `uuid`, `uid64`)
 - `<out_dir>/<city>/qa_summary_strict_filled_<city>.csv`
 
-Colab demo notebook: `notebooks/Shenzhen_demo.ipynb`.
+Demo notebook (Colab / local): `notebooks/Shenzhen_exposure_weight_demo.ipynb`.
 
 ## License
 This project is licensed under the Apache License 2.0.

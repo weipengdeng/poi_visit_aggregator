@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -184,6 +185,7 @@ def export_user_grid_time_strict_filled(
     uuid_table: Optional[Path],
     grid_meta_path: Path,
     out_dir: Path,
+    tmp_root: Optional[Path] = None,
     schema_map: dict[str, Any],
     output_grid_uid: bool,
     output_grid_id: bool,
@@ -221,11 +223,21 @@ def export_user_grid_time_strict_filled(
     city_dir.mkdir(parents=True, exist_ok=True)
     run_log_path = city_dir / f"run_log_strict_filled_{city}.txt"
 
+    log_file_failed = False
+
     def log(msg: str) -> None:
+        nonlocal log_file_failed
         line = f"[{_now_str()}] {msg}"
         print(line)
-        with open(run_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        if log_file_failed:
+            return
+        try:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:  # pragma: no cover
+            log_file_failed = True
+            print(f"[{_now_str()}] WARN: cannot write run log to {run_log_path}: {e}")
 
     id_mode_n = id_mode.strip().lower()
     if id_mode_n not in {"uuid", "uid64", "both"}:
@@ -362,18 +374,48 @@ def export_user_grid_time_strict_filled(
     scan_cols = [c for c in scan_cols if c is not None]
     log(f"Staypoints scan columns: {scan_cols}")
 
-    tmp_dir = city_dir / "_tmp_strict_filled"
+    tmp_root_n = Path(tmp_root).expanduser() if tmp_root is not None else None
+    tmp_dir = (tmp_root_n / city / "_tmp_strict_filled") if tmp_root_n is not None else (city_dir / "_tmp_strict_filled")
     interval_parts_dir = tmp_dir / "interval_parts"
     point_parts_dir = tmp_dir / "point_parts"
-    interval_parts_dir.mkdir(parents=True, exist_ok=True)
-    point_parts_dir.mkdir(parents=True, exist_ok=True)
-    if not keep_intermediate and not resume_stage2:
-        with _step(log, "Clean intermediate parts"):
-            for p in list(interval_parts_dir.glob("part_*.parquet")) + list(point_parts_dir.glob("part_*.parquet")):
-                p.unlink()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    if not resume_stage2:
+        with _step(log, "Reset intermediate parts dirs"):
+            for d in [interval_parts_dir, point_parts_dir]:
+                if not d.exists():
+                    d.mkdir(parents=True, exist_ok=True)
+                    continue
+                try:
+                    has_parts = next(d.glob("part_*.parquet"), None) is not None
+                except Exception:
+                    has_parts = True
+                if not has_parts:
+                    continue
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = d.with_name(f"{d.name}_old_{ts}")
+                i = 0
+                while backup.exists():
+                    i += 1
+                    backup = d.with_name(f"{d.name}_old_{ts}_{i}")
+                try:
+                    d.rename(backup)
+                    log(f"Moved old parts aside: {backup}")
+                except Exception as e:
+                    log(f"WARN: failed to rename {d} ({e}); trying to delete it instead.")
+                    try:
+                        shutil.rmtree(d)
+                    except Exception as e2:
+                        raise RuntimeError(
+                            f"Failed to reset intermediate dir {d}. "
+                            "On Colab, set tmp_root to local disk (e.g. /tmp) to avoid Google Drive I/O issues."
+                        ) from e2
+                d.mkdir(parents=True, exist_ok=True)
 
     qa: dict[str, Any] = {
         "city": city,
+        "tmp_root": _as_posix(tmp_root_n) if tmp_root_n is not None else "",
+        "tmp_dir": _as_posix(tmp_dir),
         "id_mode": id_mode_n,
         "output_grid_uid": bool(output_grid_uid),
         "output_grid_id": bool(output_grid_id),
@@ -1128,8 +1170,23 @@ def _run_stage2_and_write(
 
     if not keep_intermediate:
         with _step(log, "Clean intermediate parts"):
-            for p in list(interval_parts_dir.glob("part_*.parquet")) + list(point_parts_dir.glob("part_*.parquet")):
-                p.unlink()
+            for d in [interval_parts_dir, point_parts_dir]:
+                if not d.exists():
+                    continue
+                try:
+                    shutil.rmtree(d)
+                except Exception as e:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup = d.with_name(f"{d.name}_old_{ts}")
+                    i = 0
+                    while backup.exists():
+                        i += 1
+                        backup = d.with_name(f"{d.name}_old_{ts}_{i}")
+                    try:
+                        d.rename(backup)
+                        log(f"WARN: failed to delete {d} ({e}); renamed to {backup} instead.")
+                    except Exception:
+                        log(f"WARN: failed to delete {d}: {e}")
 
     log("Done.")
     log("=" * 70)
@@ -1143,6 +1200,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--uuid_table", default=None, help="Optional uuid table (.parquet or .csv) for whitelist filtering")
     p.add_argument("--grid_meta", required=True, help="grid_meta_<city>.json")
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--tmp_root", default=None, help="Optional intermediate tmp root (recommended on Colab: /tmp)")
 
     p.add_argument("--schema_map", default=None, help="JSON string or path to JSON file")
     p.add_argument("--output_grid_uid", type=_str2bool, default=True, help="If true, output string grid_uid")
@@ -1197,6 +1255,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     uuid_table = Path(args.uuid_table).resolve() if args.uuid_table else None
     grid_meta_path = Path(args.grid_meta).resolve()
     out_dir = Path(args.out_dir).resolve()
+    tmp_root = Path(args.tmp_root).resolve() if args.tmp_root else None
     duckdb_temp_dir = Path(args.duckdb_temp_dir).resolve() if args.duckdb_temp_dir else None
 
     windows = [w.strip() for w in args.windows.split(",") if w.strip()]
@@ -1208,6 +1267,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         uuid_table=uuid_table,
         grid_meta_path=grid_meta_path,
         out_dir=out_dir,
+        tmp_root=tmp_root,
         schema_map=schema_map,
         output_grid_uid=args.output_grid_uid,
         output_grid_id=args.output_grid_id,

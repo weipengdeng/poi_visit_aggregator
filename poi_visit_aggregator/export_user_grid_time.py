@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
@@ -571,6 +572,7 @@ def export_user_grid_time(
     poi_meta: Optional[Path],
     grid_meta_path: Path,
     out_dir: Path,
+    tmp_root: Optional[Path] = None,
     schema_map: dict[str, Any],
     output_grid_uid: bool,
     output_grid_id: bool,
@@ -604,11 +606,21 @@ def export_user_grid_time(
     city_dir.mkdir(parents=True, exist_ok=True)
     run_log_path = city_dir / f"run_log_{city}.txt"
 
+    log_file_failed = False
+
     def log(msg: str) -> None:
+        nonlocal log_file_failed
         line = f"[{_now_str()}] {msg}"
         print(line)
-        with open(run_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        if log_file_failed:
+            return
+        try:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:  # pragma: no cover
+            log_file_failed = True
+            print(f"[{_now_str()}] WARN: cannot write run log to {run_log_path}: {e}")
 
     log("=" * 70)
     log(f"Start export_user_grid_time city={city!r}")
@@ -724,16 +736,39 @@ def export_user_grid_time(
     scan_cols = [c for c in scan_cols if c is not None]
     log(f"Staypoints scan columns: {scan_cols}")
 
-    tmp_dir = city_dir / "_tmp"
+    tmp_root_n = Path(tmp_root).expanduser() if tmp_root is not None else None
+    tmp_dir = (tmp_root_n / city / "_tmp") if tmp_root_n is not None else (city_dir / "_tmp")
     bucket_root = tmp_dir / "buckets"
-    if bucket_root.exists() and not keep_intermediate:
-        for p in bucket_root.glob("**/*.parquet"):
-            p.unlink()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    if bucket_root.exists():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = bucket_root.with_name(f"{bucket_root.name}_old_{ts}")
+        i = 0
+        while backup.exists():
+            i += 1
+            backup = bucket_root.with_name(f"{bucket_root.name}_old_{ts}_{i}")
+        try:
+            bucket_root.rename(backup)
+            log(f"Moved old bucket files aside: {backup}")
+        except Exception as e:
+            log(f"WARN: failed to rename {bucket_root} ({e}); trying to delete it instead.")
+            try:
+                shutil.rmtree(bucket_root)
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Failed to reset intermediate bucket dir {bucket_root}. "
+                    "On Colab, avoid writing intermediates to Google Drive."
+                ) from e2
+
+    bucket_root.mkdir(parents=True, exist_ok=True)
 
     bucket_part = np.zeros(int(buckets), dtype=np.int64)
 
     qa: dict[str, Any] = {
         "city": city,
+        "tmp_root": _as_posix(tmp_root_n) if tmp_root_n is not None else "",
+        "tmp_dir": _as_posix(tmp_dir),
         "output_grid_uid": bool(output_grid_uid),
         "output_grid_id": bool(output_grid_id),
         "grid_uid_prefix": grid_uid_prefix_n,
@@ -1222,8 +1257,20 @@ def export_user_grid_time(
 
     if not keep_intermediate and bucket_root.exists():
         log("Cleaning intermediate bucket parquet...")
-        for p in bucket_root.glob("**/*.parquet"):
-            p.unlink()
+        try:
+            shutil.rmtree(bucket_root)
+        except Exception as e:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = bucket_root.with_name(f"{bucket_root.name}_old_{ts}")
+            i = 0
+            while backup.exists():
+                i += 1
+                backup = bucket_root.with_name(f"{bucket_root.name}_old_{ts}_{i}")
+            try:
+                bucket_root.rename(backup)
+                log(f"WARN: failed to delete {bucket_root} ({e}); renamed to {backup} instead.")
+            except Exception:
+                log(f"WARN: failed to delete {bucket_root}: {e}")
 
     log("Done.")
     log("=" * 70)
@@ -1257,6 +1304,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--poi_meta", default=None, help="Optional POI category table (.parquet or .csv)")
     p.add_argument("--grid_meta", required=True, help="grid_meta_<city>.json")
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--tmp_root", default=None, help="Optional intermediate tmp root (recommended on Colab: /tmp)")
 
     p.add_argument("--schema_map", default=None, help="JSON string or path to JSON file")
     p.add_argument("--output_grid_uid", type=_str2bool, default=True, help="If true, output string grid_uid")
@@ -1304,6 +1352,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     poi_meta = Path(args.poi_meta).resolve() if args.poi_meta else None
     grid_meta_path = Path(args.grid_meta).resolve()
     out_dir = Path(args.out_dir).resolve()
+    tmp_root = Path(args.tmp_root).resolve() if args.tmp_root else None
 
     windows = [w.strip() for w in args.windows.split(",") if w.strip()]
     food_keywords = [k.strip() for k in args.food_category_keywords.split(",") if k.strip()]
@@ -1316,6 +1365,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         poi_meta=poi_meta,
         grid_meta_path=grid_meta_path,
         out_dir=out_dir,
+        tmp_root=tmp_root,
         schema_map=schema_map,
         output_grid_uid=args.output_grid_uid,
         output_grid_id=args.output_grid_id,
