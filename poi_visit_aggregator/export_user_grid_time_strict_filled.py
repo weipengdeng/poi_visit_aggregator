@@ -205,6 +205,7 @@ def export_user_grid_time_strict_filled(
     uid64_hash_method: str,
     buckets: int,  # reserved for future bucketed stage-2
     batch_size: int,
+    log_every_batches: int = 500,
     overlap_rounding: str,
     oob_mode: str,
     threads: int,
@@ -231,6 +232,9 @@ def export_user_grid_time_strict_filled(
         raise ValueError("--id_mode must be uuid|uid64|both")
     store_uuid = id_mode_n in {"uuid", "both"}
     store_uid64 = id_mode_n in {"uid64", "both"}
+    log_every_batches_n = int(log_every_batches)
+    if log_every_batches_n < 0:
+        log_every_batches_n = 0
 
     if duckdb is None:
         raise RuntimeError("This exporter requires DuckDB: `pip install duckdb`")
@@ -399,6 +403,7 @@ def export_user_grid_time_strict_filled(
         "interval_cross_day_rows": 0,
         "interval_multi_day_rows_dropped": 0,
         "resume_stage2": bool(resume_stage2),
+        "log_every_batches": int(log_every_batches_n),
     }
 
     point_source_value_l = point_source_value.strip().lower()
@@ -729,7 +734,7 @@ def export_user_grid_time_strict_filled(
                             _write_table_zstd(t, point_parts_dir / f"part_{part_id:06d}.parquet")
                             point_rows_out = t.num_rows
 
-                if batch_i % 50 == 0:
+                if log_every_batches_n > 0 and batch_i % log_every_batches_n == 0:
                     log(
                         f"batches={batch_i:,}, input_rows={qa['input_rows']:,}, kept_rows={qa['kept_rows']:,}, "
                         f"interval_out={interval_rows_out:,}, point_out={point_rows_out:,}"
@@ -1169,6 +1174,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--buckets", type=int, default=256, help="(reserved) future stage-2 bucketing")
     p.add_argument("--batch_size", type=int, default=1_000_000)
+    p.add_argument("--log_every_batches", type=int, default=500, help="Log progress every N batches (0 disables)")
     p.add_argument("--overlap_rounding", default="floor", choices=["floor", "round", "ceil"])
     p.add_argument("--oob_mode", default="drop", choices=["drop", "null", "keep"])
 
@@ -1223,6 +1229,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         uid64_hash_method=args.uid64_hash_method,
         buckets=args.buckets,
         batch_size=args.batch_size,
+        log_every_batches=args.log_every_batches,
         overlap_rounding=args.overlap_rounding,
         oob_mode=args.oob_mode,
         threads=args.threads,

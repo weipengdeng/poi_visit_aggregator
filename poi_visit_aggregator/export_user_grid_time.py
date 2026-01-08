@@ -592,6 +592,7 @@ def export_user_grid_time(
     uuid_hash_method: str,
     buckets: int,
     batch_size: int,
+    log_every_batches: int = 500,
     overlap_rounding: str,
     oob_mode: str,
     threads: int,
@@ -632,6 +633,9 @@ def export_user_grid_time(
     epoch_unit = epoch_unit.lower()
     if epoch_unit not in {"ms", "s"}:
         raise ValueError("--epoch_unit must be ms or s")
+    log_every_batches_n = int(log_every_batches)
+    if log_every_batches_n < 0:
+        log_every_batches_n = 0
     if export_covariates and not uuid_table:
         raise ValueError("--uuid_table is required when export_covariates=true")
 
@@ -738,6 +742,7 @@ def export_user_grid_time(
         "filter_city_code": bool(filter_city_code),
         "city_code_col": city_code_col,
         "city_code_value": city_code_value,
+        "log_every_batches": int(log_every_batches_n),
         "input_rows": 0,
         "kept_rows": 0,
         "filtered_poi_id_zero": 0,
@@ -963,7 +968,7 @@ def export_user_grid_time(
             )
             _write_table_zstd(table, out_path)
 
-        if batch_i % 50 == 0:
+        if log_every_batches_n > 0 and batch_i % log_every_batches_n == 0:
             log(f"Processed batches={batch_i:,}, input_rows={qa['input_rows']:,}, kept_rows={qa['kept_rows']:,}")
 
     if qa["input_rows"] > 0:
@@ -1276,6 +1281,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--uuid_hash_method", default="sha256_64", choices=["sha256_64", "md5_64", "pandas_64", "xxh64"])
     p.add_argument("--buckets", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=1_000_000)
+    p.add_argument("--log_every_batches", type=int, default=500, help="Log progress every N batches (0 disables)")
     p.add_argument("--overlap_rounding", default="floor", choices=["floor", "round", "ceil"])
     p.add_argument("--oob_mode", default="drop", choices=["drop", "null", "keep"])
 
@@ -1331,6 +1337,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         uuid_hash_method=args.uuid_hash_method,
         buckets=args.buckets,
         batch_size=args.batch_size,
+        log_every_batches=args.log_every_batches,
         overlap_rounding=args.overlap_rounding,
         oob_mode=args.oob_mode,
         threads=args.threads,
