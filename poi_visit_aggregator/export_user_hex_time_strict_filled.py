@@ -1,0 +1,1422 @@
+"""
+Export user×H3-hex lunch/dinner stay-minute weights with strict/fill/filled scheme.
+
+This exporter is analogous to `export_user_grid_time_strict_filled`, but uses an
+H3 city-range meta JSON (e.g. `hex_meta_Shenzhen_440300.json`) as the spatial unit
+definition:
+  - Map point -> H3 cell at `h3_resolution`
+  - Filter to city range by `h3_ids` (recommended: pre-filter staypoints by city code too)
+
+Outputs (per city):
+  - user_hex_time_strict_filled_<city>.parquet
+  - qa_summary_hex_strict_filled_<city>.csv
+
+Run:
+  python -m poi_visit_aggregator.export_user_hex_time_strict_filled --help
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from glob import glob
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
+import psutil
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+from poi_visit_aggregator.export_user_grid_time import (
+    DEFAULT_WINDOWS,
+    MS_PER_DAY,
+    MS_PER_MIN,
+    WindowSpec,
+    _as_posix,
+    _col_as_float64,
+    _col_as_int64,
+    _col_as_str,
+    _compute_window_overlap_minutes,
+    _hash_uuid,
+    _infer_col,
+    _parse_hhmm,
+    _parse_location_to_lonlat,
+    _require_col,
+    _write_table_zstd,
+)
+
+try:
+    import duckdb  # type: ignore
+except Exception:  # pragma: no cover
+    duckdb = None
+
+try:
+    import h3  # type: ignore
+    from h3.api import basic_int as h3_int  # type: ignore
+except Exception:  # pragma: no cover
+    h3 = None
+    h3_int = None
+
+
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _str2bool(v: str) -> bool:
+    vv = v.strip().lower()
+    if vv in {"1", "true", "t", "yes", "y"}:
+        return True
+    if vv in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean: {v!r}")
+
+
+def _load_json_arg(value: Optional[str]) -> dict[str, Any]:
+    if not value:
+        return {}
+    p = Path(value)
+    if p.exists() and p.is_file():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return json.loads(value)
+
+
+def _resolve_input_paths(patterns: list[str]) -> list[Path]:
+    out: list[Path] = []
+    for pat in patterns:
+        matches = glob(pat)
+        if matches:
+            out.extend(Path(m) for m in matches)
+        else:
+            out.append(Path(pat))
+    uniq: list[Path] = []
+    seen: set[Path] = set()
+    for p in out:
+        rp = p.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        uniq.append(rp)
+    return uniq
+
+
+def _rss_mb() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+
+
+@contextmanager
+def _step(log, name: str):
+    t0 = time.perf_counter()
+    m0 = _rss_mb()
+    log(f"[START] {name} (RAM={m0:,.0f} MB)")
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        m1 = _rss_mb()
+        log(f"[ END ] {name} (dt={dt:,.1f}s, RAM={m1:,.0f} MB, Δ={m1 - m0:,.0f} MB)")
+
+
+def _is_weekend_from_epoch_day(day: np.ndarray) -> np.ndarray:
+    # 1970-01-01 is Thursday. Monday=0..Sunday=6 => Thursday=3.
+    weekday = (day.astype(np.int64, copy=False) + 3) % 7
+    return weekday >= 5
+
+
+def _in_window(mod_ms: np.ndarray, spec: WindowSpec) -> np.ndarray:
+    out = np.zeros(len(mod_ms), dtype=bool)
+    for seg_start, seg_end in spec.segments:
+        out |= (mod_ms >= seg_start) & (mod_ms < seg_end)
+    return out
+
+
+def _mask_in_sorted_uint64(values: np.ndarray, sorted_unique: np.ndarray) -> np.ndarray:
+    if len(sorted_unique) == 0:
+        return np.zeros(len(values), dtype=bool)
+    idx = np.searchsorted(sorted_unique, values)
+    ok = idx < len(sorted_unique)
+    out = np.zeros(len(values), dtype=bool)
+    out[ok] = sorted_unique[idx[ok]] == values[ok]
+    return out
+
+
+def _load_uuid_whitelist_uid64(
+    uuid_table: Path,
+    *,
+    schema_map: dict[str, Any],
+    uid64_hash_method: str,
+    log,
+) -> np.ndarray:
+    uuid_schema_map = schema_map.get("uuid_table", {})
+    if uuid_table.suffix.lower() == ".parquet":
+        schema = pq.read_schema(_as_posix(uuid_table))
+        uuid_c = uuid_schema_map.get("uuid") or _infer_col(schema, ["uuid", "user", "uid"])
+        uuid_c = _require_col("uuid_table.uuid", uuid_c)
+        t = pq.read_table(_as_posix(uuid_table), columns=[uuid_c])
+        uuids = t.column(0).to_pandas().astype(str).to_numpy()
+    else:
+        header = pd.read_csv(uuid_table, nrows=0, on_bad_lines="skip")
+        uuid_c = uuid_schema_map.get("uuid") or ("uuid" if "uuid" in header.columns else None)
+        uuid_c = _require_col("uuid_table.uuid", uuid_c)
+        df = pd.read_csv(uuid_table, usecols=[uuid_c], dtype={uuid_c: "string"}, on_bad_lines="skip")
+        uuids = df[uuid_c].astype(str).to_numpy()
+
+    with _step(log, f"Hash uuid whitelist ({len(uuids):,})"):
+        uid64 = _hash_uuid(uuids, uid64_hash_method)
+        uid64 = np.unique(uid64)
+        uid64.sort()
+    log(f"Loaded uuid whitelist uid64: {len(uid64):,}")
+    return uid64
+
+
+@dataclass(frozen=True)
+class HexMeta:
+    city: str
+    code: Optional[str]
+    coord_crs: str
+    h3_resolution: int
+    boundary_layer: Optional[str]
+    bbox: Optional[tuple[float, float, float, float]]  # (min_lon, min_lat, max_lon, max_lat) in WGS84
+    n_hexes: Optional[int]
+    h3_ids: list[str]
+    source_gpkg: Optional[str]
+
+    @classmethod
+    def from_json(cls, path: Path) -> "HexMeta":
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw, dict):
+            raise ValueError("hex_meta json must be a top-level object (dict).")
+
+        city = str(raw.get("city") or path.stem).strip()
+        if not city:
+            raise ValueError("hex_meta missing required field: city")
+
+        code = raw.get("code")
+        code_s = None
+        if code is not None and str(code).strip() != "":
+            code_s = str(code).strip()
+
+        coord_crs = str(raw.get("coord_crs") or "EPSG:4326").strip() or "EPSG:4326"
+        h3_resolution = raw.get("h3_resolution")
+        if h3_resolution is None:
+            raise ValueError("hex_meta missing required field: h3_resolution")
+        h3_resolution_i = int(h3_resolution)
+
+        bbox = None
+        if isinstance(raw.get("bbox"), (list, tuple)) and len(raw["bbox"]) == 4:
+            bb = raw["bbox"]
+            bbox = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+
+        h3_ids = raw.get("h3_ids")
+        if not isinstance(h3_ids, list) or not h3_ids:
+            raise ValueError("hex_meta missing required field: h3_ids (non-empty list)")
+        h3_ids_s = [str(x).strip() for x in h3_ids if str(x).strip()]
+        if not h3_ids_s:
+            raise ValueError("hex_meta.h3_ids is empty after stripping.")
+
+        n_hexes = raw.get("n_hexes")
+        n_hexes_i = int(n_hexes) if n_hexes is not None else None
+
+        return cls(
+            city=city,
+            code=code_s,
+            coord_crs=coord_crs,
+            h3_resolution=h3_resolution_i,
+            boundary_layer=str(raw.get("boundary_layer")).strip() if raw.get("boundary_layer") is not None else None,
+            bbox=bbox,
+            n_hexes=n_hexes_i,
+            h3_ids=h3_ids_s,
+            source_gpkg=str(raw.get("source_gpkg")).strip() if raw.get("source_gpkg") is not None else None,
+        )
+
+
+def _infer_hex_uid_code_from_hex_meta(path: Path) -> Optional[str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    for k in ("hex_uid_code", "city_code", "code", "adcode"):
+        v = raw.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return None
+
+
+def _normalize_hex_uid_code(*, city: str, hex_meta_path: Path, hex_uid_code: Optional[str]) -> str:
+    if hex_uid_code is not None and str(hex_uid_code).strip():
+        return str(hex_uid_code).strip()
+    inferred = _infer_hex_uid_code_from_hex_meta(hex_meta_path)
+    if inferred:
+        return inferred
+    return str(city).strip()
+
+
+def _h3_latlng_to_cell_int(lat: np.ndarray, lon: np.ndarray, res: int) -> np.ndarray:
+    if h3_int is None:  # pragma: no cover
+        raise RuntimeError("H3 mapping requires `pip install h3`")
+    lat_list = lat.astype(np.float64, copy=False).tolist()
+    lon_list = lon.astype(np.float64, copy=False).tolist()
+    out = np.empty(len(lat_list), dtype=np.uint64)
+    for i, (la, lo) in enumerate(zip(lat_list, lon_list)):
+        out[i] = np.uint64(h3_int.latlng_to_cell(float(la), float(lo), int(res)))
+    return out
+
+
+def export_user_hex_time_strict_filled(
+    *,
+    city: str,
+    staypoints: list[Path],
+    staypoints_format: str,
+    uuid_table: Optional[Path],
+    hex_meta_path: Path,
+    out_dir: Path,
+    tmp_root: Optional[Path] = None,
+    schema_map: dict[str, Any],
+    output_hex_uid: bool = True,
+    output_h3_id: bool = True,
+    output_h3_int: bool = False,
+    hex_uid_code: Optional[str] = None,
+    hex_uid_prefix: str = "hex",
+    filter_city_code: bool = False,
+    city_code_col: Optional[str] = None,
+    city_code_value: Optional[str] = None,
+    windows: list[str] | None = None,
+    min_interval_minutes: int = 5,
+    point_source_filter: bool = True,
+    point_source_value: str = "cell_appearance",
+    drop_uuid_not_in_table: bool = False,
+    timestamps_are_utc: bool = True,
+    tz_offset_hours: int = 8,
+    epoch_unit: str = "ms",
+    uid64_hash_method: str = "sha256_64",
+    buckets: int = 256,  # reserved for future bucketed stage-2
+    batch_size: int = 1_000_000,
+    log_every_batches: int = 500,
+    overlap_rounding: str = "floor",
+    oob_mode: str = "drop",
+    threads: int = 8,
+    memory_limit: str = "16GB",
+    duckdb_temp_dir: Optional[Path] = None,
+    id_mode: str = "uuid",
+    resume_stage2: bool = False,
+    keep_intermediate: bool = False,
+) -> None:
+    del buckets  # reserved
+
+    if duckdb is None:
+        raise RuntimeError("This exporter requires DuckDB: `pip install duckdb`")
+    if h3 is None or h3_int is None:
+        raise RuntimeError("This exporter requires H3: `pip install h3`")
+
+    city_dir = out_dir / city
+    city_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = city_dir / f"run_log_hex_strict_filled_{city}.txt"
+
+    log_file_failed = False
+
+    def log(msg: str) -> None:
+        nonlocal log_file_failed
+        line = f"[{_now_str()}] {msg}"
+        print(line)
+        if log_file_failed:
+            return
+        try:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            log_file_failed = True
+
+    log(f"Start export_user_hex_time_strict_filled city={city!r}")
+    log(f"hex_meta_path={_as_posix(hex_meta_path)}")
+
+    id_mode_n = id_mode.strip().lower()
+    if id_mode_n not in {"uuid", "uid64", "both"}:
+        raise ValueError("--id_mode must be uuid|uid64|both")
+    store_uuid = id_mode_n in {"uuid", "both"}
+    store_uid64 = id_mode_n in {"uid64", "both"}
+    log(f"id_mode={id_mode_n}, uid64_hash_method={uid64_hash_method}, store_uuid={store_uuid}, store_uid64={store_uid64}")
+
+    windows = windows or ["lunch", "dinner"]
+    windows_norm = [str(w).strip() for w in windows if str(w).strip()]
+    if not windows_norm:
+        raise ValueError("--windows cannot be empty")
+
+    window_specs: dict[str, WindowSpec] = {}
+    window_meta_rows: list[dict[str, Any]] = []
+    for wname in windows_norm:
+        if wname in DEFAULT_WINDOWS:
+            start, end = DEFAULT_WINDOWS[wname]
+        else:
+            raise ValueError(f"Unknown window: {wname!r} (supported: {sorted(DEFAULT_WINDOWS)})")
+        spec = WindowSpec(name=wname, start_ms=_parse_hhmm(start), end_ms=_parse_hhmm(end))
+        window_specs[wname] = spec
+        segs = spec.segments
+        if len(segs) == 1:
+            start_mod_ms, end_mod_ms = segs[0]
+        else:
+            start_mod_ms, _ = segs[0]
+            _, end_mod_ms = segs[-1]
+        window_meta_rows.append(
+            {
+                "window": wname,
+                "start_mod_ms": int(start_mod_ms),
+                "end_mod_ms": int(end_mod_ms),
+                "win_len_min": float(spec.duration_ms) / MS_PER_MIN,
+            }
+        )
+    window_meta_df = pd.DataFrame(window_meta_rows)
+
+    hex_meta = HexMeta.from_json(hex_meta_path)
+    log(
+        f"hex_meta loaded: city={hex_meta.city!r}, code={hex_meta.code!r}, "
+        f"h3_resolution={hex_meta.h3_resolution}, n_hexes={len(hex_meta.h3_ids):,}"
+    )
+    if str(hex_meta.coord_crs).strip() not in {"EPSG:4326", "epsg:4326"}:
+        log(f"WARN: hex_meta.coord_crs={hex_meta.coord_crs!r}; H3 expects lat/lon in WGS84 (EPSG:4326).")
+
+    allowed_u64 = np.array([np.uint64(h3.str_to_int(s)) for s in hex_meta.h3_ids], dtype=np.uint64)
+    allowed_u64 = np.unique(allowed_u64)
+    allowed_u64.sort()
+    log(f"Loaded city hex set: {len(allowed_u64):,} cells")
+
+    hex_uid_code_n = _normalize_hex_uid_code(city=city, hex_meta_path=hex_meta_path, hex_uid_code=hex_uid_code)
+    hex_uid_prefix_n = str(hex_uid_prefix).strip()
+    if not hex_uid_prefix_n:
+        raise ValueError("--hex_uid_prefix cannot be empty")
+
+    whitelist_uid64_sorted = None
+    if drop_uuid_not_in_table and uuid_table:
+        with _step(log, "Load uuid whitelist"):
+            whitelist_uid64_sorted = _load_uuid_whitelist_uid64(
+                uuid_table, schema_map=schema_map, uid64_hash_method=uid64_hash_method, log=log
+            )
+
+    stay_schema_map = schema_map.get("staypoints", schema_map)
+
+    ds_paths = [_as_posix(p) for p in staypoints]
+    staypoints_format_n = staypoints_format.strip().lower()
+    if staypoints_format_n not in {"auto", "parquet", "csv"}:
+        raise ValueError("--staypoints_format must be auto|parquet|csv")
+    if staypoints_format_n == "auto":
+        exts = {p.suffix.lower() for p in staypoints if p.suffix}
+        if len(exts) == 1 and ".parquet" in exts:
+            staypoints_format_n = "parquet"
+        elif len(exts) == 1 and ".csv" in exts:
+            staypoints_format_n = "csv"
+        else:
+            raise ValueError("Cannot infer staypoints format; please set --staypoints_format=parquet|csv")
+
+    with _step(log, f"Open dataset ({staypoints_format_n})"):
+        if staypoints_format_n == "csv":
+            sample = ds.dataset([ds_paths[0]], format="csv")
+            dataset = ds.dataset(ds_paths, format="csv", schema=sample.schema)
+        else:
+            dataset = ds.dataset(ds_paths, format="parquet")
+        schema = dataset.schema
+
+    uuid_col = stay_schema_map.get("uuid") or _infer_col(schema, ["uuid", "user", "uid"])
+    start_col = stay_schema_map.get("start_time") or _infer_col(schema, ["start_time", "start", "start_ms", "stime"])
+    end_col = stay_schema_map.get("end_time") or _infer_col(schema, ["end_time", "end", "end_ms", "etime"])
+    uuid_col = _require_col("staypoints.uuid", uuid_col)
+    start_col = _require_col("staypoints.start_time", start_col)
+    end_col = _require_col("staypoints.end_time", end_col)
+
+    source_col = stay_schema_map.get("source") or _infer_col(schema, ["source", "src"])
+
+    lon_col = stay_schema_map.get("lon") or _infer_col(schema, ["lon", "lng", "longitude"])
+    lat_col = stay_schema_map.get("lat") or _infer_col(schema, ["lat", "latitude"])
+    loc_col = stay_schema_map.get("location") or _infer_col(schema, ["location", "loc"])
+
+    coord_mode = None
+    if lon_col and lat_col:
+        coord_mode = "lonlat"
+    elif loc_col:
+        coord_mode = "location"
+    else:
+        raise ValueError(
+            "Cannot infer lon/lat columns (need lon/lat or location). "
+            "Hex export requires coordinates in EPSG:4326. Please provide --schema_map."
+        )
+
+    scan_cols = [uuid_col, start_col, end_col]
+    if source_col:
+        scan_cols.append(source_col)
+    if coord_mode == "lonlat":
+        scan_cols += [lon_col, lat_col]
+    else:
+        scan_cols.append(loc_col)
+    scan_cols = [c for c in scan_cols if c is not None]
+    log(f"Staypoints scan columns: {scan_cols}")
+
+    tmp_root_n = Path(tmp_root).expanduser() if tmp_root is not None else None
+    tmp_dir = (tmp_root_n / city / "_tmp_hex_strict_filled") if tmp_root_n is not None else (city_dir / "_tmp_hex_strict_filled")
+    interval_parts_dir = tmp_dir / "interval_parts"
+    point_parts_dir = tmp_dir / "point_parts"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    qa: dict[str, Any] = {
+        "city": city,
+        "hex_meta_path": _as_posix(hex_meta_path),
+        "hex_meta_city": hex_meta.city,
+        "hex_meta_code": hex_meta.code or "",
+        "h3_resolution": int(hex_meta.h3_resolution),
+        "hex_uid_prefix": hex_uid_prefix_n,
+        "hex_uid_code": hex_uid_code_n,
+        "output_hex_uid": bool(output_hex_uid),
+        "output_h3_id": bool(output_h3_id),
+        "output_h3_int": bool(output_h3_int),
+        "tmp_root": _as_posix(tmp_root_n) if tmp_root_n is not None else "",
+        "tmp_dir": _as_posix(tmp_dir),
+        "id_mode": id_mode_n,
+        "drop_uuid_not_in_table": bool(drop_uuid_not_in_table),
+        "point_source_filter": bool(point_source_filter),
+        "point_source_value": point_source_value,
+        "min_interval_minutes": int(min_interval_minutes),
+        "windows": ",".join(windows_norm),
+        "input_rows": 0,
+        "kept_rows": 0,
+        "invalid_time_rows": 0,
+        "invalid_coord_rows": 0,
+        "filtered_uuid_not_in_table": 0,
+        "filtered_oob_hex": 0,
+        "interval_rows": 0,
+        "point_rows": 0,
+        "point_rows_used": 0,
+        "point_rows_outside_windows": 0,
+        "interval_cross_day_rows": 0,
+        "interval_multi_day_rows_dropped": 0,
+        "resume_stage2": bool(resume_stage2),
+        "log_every_batches": int(log_every_batches),
+    }
+
+    out_path = city_dir / f"user_hex_time_strict_filled_{city}.parquet"
+    qa_path = city_dir / f"qa_summary_hex_strict_filled_{city}.csv"
+
+    if resume_stage2:
+        interval_files = list(interval_parts_dir.glob("part_*.parquet"))
+        point_files = list(point_parts_dir.glob("part_*.parquet"))
+        qa["resume_interval_parts"] = len(interval_files)
+        qa["resume_point_parts"] = len(point_files)
+        if not interval_files and not point_files:
+            raise ValueError(
+                "resume_stage2=true but no intermediate parts found. "
+                f"Expected files under: {interval_parts_dir} and/or {point_parts_dir}. "
+                "Run once with resume_stage2=false to generate them."
+            )
+        log(f"Resume Stage-2 from existing parts: interval_parts={len(interval_files):,}, point_parts={len(point_files):,}")
+        _run_stage2_and_write(
+            city=city,
+            city_dir=city_dir,
+            tmp_dir=tmp_dir,
+            duckdb_temp_dir=duckdb_temp_dir,
+            interval_parts_dir=interval_parts_dir,
+            point_parts_dir=point_parts_dir,
+            out_path=out_path,
+            qa=qa,
+            qa_path=qa_path,
+            window_meta_df=window_meta_df,
+            output_hex_uid=output_hex_uid,
+            output_h3_id=output_h3_id,
+            output_h3_int=output_h3_int,
+            hex_uid_prefix=hex_uid_prefix_n,
+            hex_uid_code=hex_uid_code_n,
+            store_uuid=store_uuid,
+            store_uid64=store_uid64,
+            threads=threads,
+            memory_limit=memory_limit,
+            keep_intermediate=keep_intermediate,
+            log=log,
+        )
+        return
+
+    filter_expr = None
+    if filter_city_code:
+        city_col = (
+            (stay_schema_map.get("city_code") or stay_schema_map.get("c_code")) if isinstance(stay_schema_map, dict) else None
+        )
+        if city_code_col:
+            city_col = city_code_col
+        if not city_col:
+            city_col = _infer_col(schema, ["c_code", "city_code", "adcode", "city", "city_id", "cityid"])
+        city_col = _require_col("staypoints.city_code", city_col)
+        if city_col not in scan_cols:
+            scan_cols.append(city_col)
+
+        val = city_code_value
+        if val is None or str(val).strip() == "":
+            if hex_uid_code is not None and str(hex_uid_code).strip() != "":
+                val = str(hex_uid_code).strip()
+            elif hex_meta.code is not None and str(hex_meta.code).strip() != "":
+                val = str(hex_meta.code).strip()
+            else:
+                raise ValueError(
+                    "filter_city_code=true requires --city_code_value or --hex_uid_code, or `code` in hex_meta json."
+                )
+        qa["city_code_col"] = city_col
+        qa["city_code_value"] = str(val)
+        filter_expr = ds.field(city_col).cast(pa.string()) == str(val)
+
+    scanner = dataset.scanner(columns=scan_cols, filter=filter_expr, batch_size=batch_size, use_threads=True)
+
+    bbox = hex_meta.bbox
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+
+    epoch_unit_n = epoch_unit.strip().lower()
+    if epoch_unit_n not in {"ms", "s"}:
+        raise ValueError("--epoch_unit must be ms|s")
+    tz_offset_ms = int(tz_offset_hours) * 3600 * 1000
+
+    oob_mode_n = str(oob_mode).strip().lower()
+    if oob_mode_n not in {"drop", "null", "keep"}:
+        raise ValueError("--oob_mode must be drop|null|keep")
+
+    if not resume_stage2:
+        with _step(log, "Reset intermediate parts dirs"):
+            for d in [interval_parts_dir, point_parts_dir]:
+                if not d.exists():
+                    d.mkdir(parents=True, exist_ok=True)
+                    continue
+                try:
+                    has_parts = next(d.glob("part_*.parquet"), None) is not None
+                except Exception:
+                    has_parts = True
+                if not has_parts:
+                    continue
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = d.with_name(f"{d.name}_old_{ts}")
+                i = 0
+                while backup.exists():
+                    i += 1
+                    backup = d.with_name(f"{d.name}_old_{ts}_{i}")
+                try:
+                    d.rename(backup)
+                    log(f"Moved old parts aside: {backup}")
+                except Exception as e:
+                    log(f"WARN: failed to rename {d} ({e}); trying to delete it instead.")
+                    try:
+                        shutil.rmtree(d)
+                    except Exception as e2:
+                        raise RuntimeError(f"Failed to reset intermediate dir {d}.") from e2
+                d.mkdir(parents=True, exist_ok=True)
+
+    point_source_value_l = point_source_value.strip().lower()
+
+    part_id = 0
+    batch_i = 0
+
+    with _step(log, "Stage-1 scan + write parts"):
+        for batch in scanner.to_batches():
+            batch_i += 1
+            n = batch.num_rows
+            qa["input_rows"] += n
+            if n == 0:
+                continue
+
+            uuid_vals = _col_as_str(batch.column(uuid_col))
+            start_ms = _col_as_int64(batch.column(start_col))
+            end_ms = _col_as_int64(batch.column(end_col))
+
+            if epoch_unit_n == "s":
+                start_ms = start_ms * 1000
+                end_ms = end_ms * 1000
+            if timestamps_are_utc:
+                start_ms = start_ms + tz_offset_ms
+                end_ms = end_ms + tz_offset_ms
+
+            valid_time = (start_ms >= 0) & (end_ms >= start_ms)
+            qa["invalid_time_rows"] += int((~valid_time).sum())
+            mask = valid_time & (uuid_vals != "")
+            if not mask.any():
+                continue
+
+            idx = np.nonzero(mask)[0]
+            uuid_keep = uuid_vals[idx]
+            uid64_keep = _hash_uuid(uuid_keep, uid64_hash_method)
+
+            if whitelist_uid64_sorted is not None:
+                before = len(idx)
+                in_tbl = _mask_in_sorted_uint64(uid64_keep, whitelist_uid64_sorted)
+                qa["filtered_uuid_not_in_table"] += before - int(in_tbl.sum())
+                idx = idx[in_tbl]
+                uuid_keep = uuid_keep[in_tbl]
+                uid64_keep = uid64_keep[in_tbl]
+                if len(idx) == 0:
+                    continue
+
+            if coord_mode == "lonlat":
+                lon = _col_as_float64(batch.column(lon_col))[idx]  # type: ignore[arg-type]
+                lat = _col_as_float64(batch.column(lat_col))[idx]  # type: ignore[arg-type]
+            else:
+                lon_all, lat_all = _parse_location_to_lonlat(batch.column(loc_col))  # type: ignore[arg-type]
+                lon = lon_all[idx]
+                lat = lat_all[idx]
+
+            valid_coord = np.isfinite(lon) & np.isfinite(lat)
+            valid_coord &= (lat >= -90.0) & (lat <= 90.0) & (lon >= -180.0) & (lon <= 180.0)
+            if bbox is not None:
+                valid_coord &= (lon >= min_lon) & (lon <= max_lon) & (lat >= min_lat) & (lat <= max_lat)
+            qa["invalid_coord_rows"] += int((~valid_coord).sum())
+            if not valid_coord.any():
+                continue
+
+            idx = idx[valid_coord]
+            uuid_keep = uuid_keep[valid_coord]
+            uid64_keep = uid64_keep[valid_coord]
+            lon = lon[valid_coord]
+            lat = lat[valid_coord]
+
+            h3_u64 = _h3_latlng_to_cell_int(lat, lon, hex_meta.h3_resolution)
+            in_city = _mask_in_sorted_uint64(h3_u64, allowed_u64)
+            qa["filtered_oob_hex"] += int((~in_city).sum())
+
+            if oob_mode_n == "drop":
+                keep = in_city
+                if not keep.any():
+                    continue
+                idx = idx[keep]
+                uuid_keep = uuid_keep[keep]
+                uid64_keep = uid64_keep[keep]
+                h3_u64 = h3_u64[keep]
+            elif oob_mode_n == "null":
+                h3_u64 = np.where(in_city, h3_u64, np.uint64(0)).astype(np.uint64, copy=False)
+            else:
+                # keep: include all cells (within bbox) even if not in city set
+                pass
+
+            start_ms_f = start_ms[idx]
+            end_ms_f = end_ms[idx]
+            qa["kept_rows"] += len(idx)
+
+            dur_ms = (end_ms_f - start_ms_f).astype(np.int64, copy=False)
+            is_interval = (dur_ms > 0) & (dur_ms >= int(min_interval_minutes) * MS_PER_MIN)
+            is_point = ~is_interval
+            qa["interval_rows"] += int(is_interval.sum())
+            qa["point_rows"] += int(is_point.sum())
+
+            part_id += 1
+            interval_rows_out = 0
+            point_rows_out = 0
+
+            if is_interval.any():
+                int_idx = np.nonzero(is_interval)[0]
+                int_start = start_ms_f[int_idx]
+                int_end = end_ms_f[int_idx]
+                day0 = (int_start // MS_PER_DAY).astype(np.int64)
+                day1 = ((int_end - 1) // MS_PER_DAY).astype(np.int64)
+                same_day = day1 == day0
+                cross_1 = day1 == (day0 + 1)
+                multi_day = day1 > (day0 + 1)
+                qa["interval_cross_day_rows"] += int(cross_1.sum())
+                qa["interval_multi_day_rows_dropped"] += int(multi_day.sum())
+
+                seg_uid64 = []
+                seg_uuid = []
+                seg_h3 = []
+                seg_day = []
+                seg_start = []
+                seg_end = []
+
+                if same_day.any():
+                    j = int_idx[same_day]
+                    seg_uid64.append(uid64_keep[j])
+                    seg_uuid.append(uuid_keep[j])
+                    seg_h3.append(h3_u64[j])
+                    seg_day.append(day0[same_day].astype(np.int32))
+                    seg_start.append(int_start[same_day])
+                    seg_end.append(int_end[same_day])
+
+                if cross_1.any():
+                    j = int_idx[cross_1]
+                    d0 = day0[cross_1]
+                    d1 = day1[cross_1]
+                    d0_end = (d0 + 1) * MS_PER_DAY
+                    d1_start = d1 * MS_PER_DAY
+                    seg_uid64.append(uid64_keep[j])
+                    seg_uuid.append(uuid_keep[j])
+                    seg_h3.append(h3_u64[j])
+                    seg_day.append(d0.astype(np.int32))
+                    seg_start.append(int_start[cross_1])
+                    seg_end.append(d0_end.astype(np.int64))
+                    seg_uid64.append(uid64_keep[j])
+                    seg_uuid.append(uuid_keep[j])
+                    seg_h3.append(h3_u64[j])
+                    seg_day.append(d1.astype(np.int32))
+                    seg_start.append(d1_start.astype(np.int64))
+                    seg_end.append(int_end[cross_1])
+
+                if seg_uid64:
+                    s_uid64 = np.concatenate(seg_uid64).astype(np.uint64, copy=False)
+                    s_uuid = np.concatenate(seg_uuid).astype(object, copy=False)
+                    s_h3 = np.concatenate(seg_h3).astype(np.uint64, copy=False)
+                    s_day = np.concatenate(seg_day).astype(np.int32, copy=False)
+                    s_start = np.concatenate(seg_start).astype(np.int64, copy=False)
+                    s_end = np.concatenate(seg_end).astype(np.int64, copy=False)
+
+                    out_uid64 = []
+                    out_uuid = []
+                    out_h3 = []
+                    out_day = []
+                    out_wkend = []
+                    out_win = []
+                    out_tau = []
+
+                    for wname, spec in window_specs.items():
+                        tau = _compute_window_overlap_minutes(s_start, s_end, spec, rounding=overlap_rounding)
+                        ok = tau > 0
+                        if not ok.any():
+                            continue
+                        out_uid64.append(s_uid64[ok])
+                        out_uuid.append(s_uuid[ok])
+                        out_h3.append(s_h3[ok])
+                        out_day.append(s_day[ok])
+                        out_wkend.append(_is_weekend_from_epoch_day(s_day[ok].astype(np.int64)).astype(bool))
+                        out_win.append(np.full(int(ok.sum()), wname, dtype=object))
+                        out_tau.append(tau[ok].astype(np.int32, copy=False))
+
+                    if out_uid64:
+                        t = pa.table(
+                            {
+                                "uid64": pa.array(np.concatenate(out_uid64), type=pa.uint64()),
+                                "h3_int": pa.array(np.concatenate(out_h3), type=pa.uint64()),
+                                "day": pa.array(np.concatenate(out_day), type=pa.int32()),
+                                "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
+                                "window": pa.array(np.concatenate(out_win), type=pa.string()),
+                                "tau_strict_min": pa.array(np.concatenate(out_tau), type=pa.int32()),
+                            }
+                        )
+                        if store_uuid:
+                            t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
+                        _write_table_zstd(t, interval_parts_dir / f"part_{part_id:06d}.parquet")
+                        interval_rows_out = t.num_rows
+
+            if is_point.any():
+                p_idx = np.nonzero(is_point)[0]
+                p_uid64 = uid64_keep[p_idx]
+                p_uuid = uuid_keep[p_idx]
+                p_h3 = h3_u64[p_idx]
+                p_start = start_ms_f[p_idx]
+                p_end = end_ms_f[p_idx]
+                p_mid = ((p_start.astype(np.int64) + p_end.astype(np.int64)) // 2).astype(np.int64)
+
+                use_mask = np.ones(len(p_idx), dtype=bool)
+                if point_source_filter:
+                    if source_col and source_col in batch.schema.names:
+                        src_vals = _col_as_str(batch.column(source_col))[idx][p_idx]  # type: ignore[arg-type]
+                        src_vals = np.asarray(src_vals, dtype=str)
+                        use_mask &= np.char.lower(src_vals) == point_source_value_l
+                    else:
+                        log("WARN: point_source_filter=true but `source` column not found; using all point rows.")
+                qa["point_rows_used"] += int(use_mask.sum())
+                if use_mask.any():
+                    p_uid64 = p_uid64[use_mask]
+                    p_uuid = p_uuid[use_mask]
+                    p_h3 = p_h3[use_mask]
+                    p_mid = p_mid[use_mask]
+
+                    p_day = (p_mid // MS_PER_DAY).astype(np.int64)
+                    p_mod = (p_mid - p_day * MS_PER_DAY).astype(np.int64)
+                    p_wkend = _is_weekend_from_epoch_day(p_day).astype(bool)
+
+                    out_uid64 = []
+                    out_uuid = []
+                    out_h3 = []
+                    out_day = []
+                    out_wkend = []
+                    out_win = []
+                    out_t = []
+
+                    in_any = np.zeros(len(p_mid), dtype=bool)
+                    for wname, spec in window_specs.items():
+                        ok = _in_window(p_mod, spec)
+                        if not ok.any():
+                            continue
+                        in_any |= ok
+                        out_uid64.append(p_uid64[ok])
+                        out_uuid.append(p_uuid[ok])
+                        out_h3.append(p_h3[ok])
+                        out_day.append(p_day[ok].astype(np.int32))
+                        out_wkend.append(p_wkend[ok])
+                        out_win.append(np.full(int(ok.sum()), wname, dtype=object))
+                        out_t.append(p_mid[ok].astype(np.int64))
+
+                    qa["point_rows_outside_windows"] += int((~in_any).sum())
+                    if out_uid64:
+                        t = pa.table(
+                            {
+                                "uid64": pa.array(np.concatenate(out_uid64), type=pa.uint64()),
+                                "h3_int": pa.array(np.concatenate(out_h3), type=pa.uint64()),
+                                "day": pa.array(np.concatenate(out_day), type=pa.int32()),
+                                "is_weekend": pa.array(np.concatenate(out_wkend), type=pa.bool_()),
+                                "window": pa.array(np.concatenate(out_win), type=pa.string()),
+                                "t_ms": pa.array(np.concatenate(out_t), type=pa.int64()),
+                            }
+                        )
+                        if store_uuid:
+                            t = t.append_column("uuid", pa.array(np.concatenate(out_uuid), type=pa.string()))
+                        _write_table_zstd(t, point_parts_dir / f"part_{part_id:06d}.parquet")
+                        point_rows_out = t.num_rows
+
+            if log_every_batches > 0 and batch_i % int(log_every_batches) == 0:
+                log(
+                    f"batches={batch_i:,}, input_rows={qa['input_rows']:,}, kept_rows={qa['kept_rows']:,}, "
+                    f"interval_out={interval_rows_out:,}, point_out={point_rows_out:,}"
+                )
+
+    _run_stage2_and_write(
+        city=city,
+        city_dir=city_dir,
+        tmp_dir=tmp_dir,
+        duckdb_temp_dir=duckdb_temp_dir,
+        interval_parts_dir=interval_parts_dir,
+        point_parts_dir=point_parts_dir,
+        out_path=out_path,
+        qa=qa,
+        qa_path=qa_path,
+        window_meta_df=window_meta_df,
+        output_hex_uid=output_hex_uid,
+        output_h3_id=output_h3_id,
+        output_h3_int=output_h3_int,
+        hex_uid_prefix=hex_uid_prefix_n,
+        hex_uid_code=hex_uid_code_n,
+        store_uuid=store_uuid,
+        store_uid64=store_uid64,
+        threads=threads,
+        memory_limit=memory_limit,
+        keep_intermediate=keep_intermediate,
+        log=log,
+    )
+
+
+def _run_stage2_and_write(
+    *,
+    city: str,
+    city_dir: Path,
+    tmp_dir: Path,
+    duckdb_temp_dir: Optional[Path],
+    interval_parts_dir: Path,
+    point_parts_dir: Path,
+    out_path: Path,
+    qa: dict[str, Any],
+    qa_path: Path,
+    window_meta_df: pd.DataFrame,
+    output_hex_uid: bool,
+    output_h3_id: bool,
+    output_h3_int: bool,
+    hex_uid_prefix: str,
+    hex_uid_code: str,
+    store_uuid: bool,
+    store_uid64: bool,
+    threads: int,
+    memory_limit: str,
+    keep_intermediate: bool,
+    log,
+) -> None:
+    interval_files = list(interval_parts_dir.glob("part_*.parquet"))
+    point_files = list(point_parts_dir.glob("part_*.parquet"))
+    has_interval = bool(interval_files)
+    has_point = bool(point_files)
+
+    if not (has_interval or has_point):
+        log("No interval/point parts written; writing empty output parquet.")
+        cols: dict[str, pa.Array] = {
+            "window": pa.array([], type=pa.string()),
+            "is_weekend": pa.array([], type=pa.bool_()),
+            "tau_strict_min": pa.array([], type=pa.int32()),
+            "tau_fill_min": pa.array([], type=pa.float64()),
+            "tau_filled_min": pa.array([], type=pa.float64()),
+        }
+        if output_hex_uid:
+            cols["hex_uid"] = pa.array([], type=pa.string())
+        if output_h3_id:
+            cols["h3_id"] = pa.array([], type=pa.string())
+        if output_h3_int:
+            cols["h3_int"] = pa.array([], type=pa.uint64())
+        if store_uuid:
+            cols["uuid"] = pa.array([], type=pa.string())
+        if store_uid64:
+            cols["uid64"] = pa.array([], type=pa.uint64())
+        _write_table_zstd(pa.table(cols), out_path)
+        qa["output_rows"] = 0
+        qa["output_parquet_bytes"] = int(out_path.stat().st_size)
+        qa["output_parquet_mb"] = round(qa["output_parquet_bytes"] / 1024 / 1024, 3)
+        pd.DataFrame([qa]).to_csv(qa_path, index=False, encoding="utf-8-sig")
+        log(f"Wrote: {out_path}")
+        log(f"Wrote: {qa_path}")
+        log("Done.")
+        log("=" * 70)
+        return
+
+    with _step(log, "Stage-2 DuckDB (midpoint split + strict/fill aggregation)"):
+        temp_dir = duckdb_temp_dir if duckdb_temp_dir is not None else (tmp_dir / "duckdb_tmp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(database=":memory:")
+        con.execute(f"PRAGMA threads={int(threads)}")
+        con.execute(f"PRAGMA memory_limit='{memory_limit}'")
+        con.execute(f"PRAGMA temp_directory='{_as_posix(temp_dir)}'")
+
+        con.register("window_meta_df", window_meta_df)
+        con.execute("CREATE TABLE window_meta AS SELECT * FROM window_meta_df")
+
+        if has_interval:
+            interval_glob = _as_posix(interval_parts_dir / "part_*.parquet")
+            con.execute(f"CREATE VIEW interval_raw AS SELECT * FROM read_parquet('{interval_glob}')")
+        else:
+            con.execute(
+                "CREATE VIEW interval_raw AS "
+                "SELECT 0::UBIGINT AS uid64, 0::UBIGINT AS h3_int, 0::INTEGER AS day, false::BOOLEAN AS is_weekend, "
+                "''::VARCHAR AS window, 0::INTEGER AS tau_strict_min LIMIT 0"
+            )
+
+        if has_point:
+            point_glob = _as_posix(point_parts_dir / "part_*.parquet")
+            con.execute(f"CREATE VIEW point_raw AS SELECT * FROM read_parquet('{point_glob}')")
+        else:
+            con.execute(
+                "CREATE VIEW point_raw AS "
+                "SELECT 0::UBIGINT AS uid64, 0::UBIGINT AS h3_int, 0::INTEGER AS day, false::BOOLEAN AS is_weekend, "
+                "''::VARCHAR AS window, 0::BIGINT AS t_ms LIMIT 0"
+            )
+
+        con.execute("CREATE VIEW interval_valid AS SELECT * FROM interval_raw WHERE h3_int IS NOT NULL AND h3_int != 0")
+        con.execute("CREATE VIEW point_valid AS SELECT * FROM point_raw WHERE h3_int IS NOT NULL AND h3_int != 0")
+
+        if store_uuid:
+            con.execute(
+                """
+                CREATE TABLE uuid_map AS
+                SELECT uid64, MIN(uuid) AS uuid, COUNT(DISTINCT uuid) AS n_uuid
+                FROM (
+                  SELECT uid64, uuid FROM interval_raw
+                  UNION ALL
+                  SELECT uid64, uuid FROM point_raw
+                ) u
+                GROUP BY uid64
+                """
+            )
+            qa["uid64_uuid_collision_rows"] = int(
+                con.execute("SELECT COALESCE(SUM(CASE WHEN n_uuid>1 THEN 1 ELSE 0 END), 0) FROM uuid_map").fetchone()[0]
+            )
+        else:
+            qa["uid64_uuid_collision_rows"] = 0
+
+        con.execute(
+            """
+            CREATE VIEW interval_agg AS
+            SELECT
+              uid64,
+              day,
+              is_weekend,
+              "window" AS window,
+              h3_int,
+              CAST(SUM(tau_strict_min) AS DOUBLE) AS tau_strict_min
+            FROM interval_valid
+            GROUP BY uid64, day, is_weekend, "window", h3_int
+            """
+        )
+
+        con.execute(
+            f"""
+            CREATE VIEW point_ordered AS
+            SELECT
+              p.uid64,
+              p.day,
+              p.is_weekend,
+              p."window" AS window,
+              p.h3_int,
+              p.t_ms,
+              LAG(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p."window" ORDER BY p.t_ms) AS prev_t,
+              LEAD(p.t_ms) OVER (PARTITION BY p.uid64, p.day, p."window" ORDER BY p.t_ms) AS next_t,
+              m.start_mod_ms,
+              m.end_mod_ms,
+              m.win_len_min
+            FROM point_valid p
+            JOIN window_meta m USING ("window")
+            """
+        )
+
+        con.execute(
+            f"""
+            CREATE VIEW point_agg AS
+            SELECT
+              uid64,
+              day,
+              is_weekend,
+              "window" AS window,
+              h3_int,
+              SUM(
+                GREATEST(
+                  0,
+                  LEAST(
+                    day::BIGINT*{MS_PER_DAY} + end_mod_ms,
+                    COALESCE((t_ms + next_t)/2, day::BIGINT*{MS_PER_DAY} + end_mod_ms)
+                  )
+                  - GREATEST(
+                    day::BIGINT*{MS_PER_DAY} + start_mod_ms,
+                    COALESCE((prev_t + t_ms)/2, day::BIGINT*{MS_PER_DAY} + start_mod_ms)
+                  )
+                )::DOUBLE / {MS_PER_MIN}
+              ) AS tau_point_min
+            FROM point_ordered
+            GROUP BY uid64, day, is_weekend, "window", h3_int
+            """
+        )
+
+        con.execute(
+            """
+            CREATE VIEW base AS
+            SELECT
+              uid64,
+              day,
+              is_weekend,
+              "window" AS window,
+              h3_int,
+              SUM(tau_strict_min) AS tau_strict_min,
+              SUM(tau_point_min) AS tau_point_min
+            FROM (
+              SELECT uid64, day, is_weekend, "window" AS window, h3_int, tau_strict_min, 0.0 AS tau_point_min
+              FROM interval_agg
+              UNION ALL
+              SELECT uid64, day, is_weekend, "window" AS window, h3_int, 0.0 AS tau_strict_min, tau_point_min
+              FROM point_agg
+            ) u
+            GROUP BY uid64, day, is_weekend, "window", h3_int
+            """
+        )
+
+        con.execute(
+            """
+            CREATE VIEW factors AS
+            SELECT
+              b.uid64,
+              b.day,
+              b.is_weekend,
+              b."window" AS window,
+              SUM(b.tau_strict_min) AS strict_sum_min,
+              SUM(b.tau_point_min) AS point_sum_min,
+              m.win_len_min,
+              GREATEST(0.0, m.win_len_min - SUM(b.tau_strict_min)) AS missing_min,
+              CASE
+                WHEN SUM(b.tau_point_min) > 0 THEN GREATEST(0.0, m.win_len_min - SUM(b.tau_strict_min)) / SUM(b.tau_point_min)
+                ELSE 0.0
+              END AS fill_factor
+            FROM base b
+            JOIN window_meta m USING ("window")
+            GROUP BY b.uid64, b.day, b.is_weekend, b."window", m.win_len_min
+            """
+        )
+
+        id_select_inner = ""
+        id_join = ""
+        group_extra = ""
+        id_select_outer = ""
+        if store_uuid and store_uid64:
+            id_select_inner = ", b.uid64 AS uid64, um.uuid AS uuid"
+            id_select_outer = ",\n                uid64,\n                uuid"
+            id_join = "LEFT JOIN uuid_map um USING (uid64)"
+            group_extra = ", b.uid64, um.uuid"
+        elif store_uuid:
+            id_select_inner = ", um.uuid AS uuid"
+            id_select_outer = ",\n                uuid"
+            id_join = "LEFT JOIN uuid_map um USING (uid64)"
+            group_extra = ", um.uuid"
+        elif store_uid64:
+            id_select_inner = ", b.uid64 AS uid64"
+            id_select_outer = ",\n                uid64"
+            group_extra = ", b.uid64"
+
+        outer_cols: list[str] = []
+        if output_hex_uid:
+            prefix_sql = hex_uid_prefix.replace("'", "''")
+            code_sql = hex_uid_code.replace("'", "''")
+            outer_cols.append(f"('{prefix_sql}_' || '{code_sql}_' || '_' || lower(hex(agg.h3_int))) AS hex_uid")
+        if output_h3_id:
+            outer_cols.append("lower(hex(agg.h3_int)) AS h3_id")
+        if output_h3_int:
+            outer_cols.append("agg.h3_int AS h3_int")
+        outer_cols += [
+            'agg."window" AS window',
+            "is_weekend",
+        ]
+        outer_select = ",\n                ".join(outer_cols)
+
+        con.execute(
+            f"""
+            COPY (
+              SELECT
+                {outer_select}{id_select_outer},
+                tau_strict_min,
+                tau_fill_min,
+                tau_filled_min
+              FROM (
+                SELECT
+                  b.h3_int,
+                  b."window" AS window,
+                  b.is_weekend
+                  {id_select_inner},
+                  CAST(SUM(b.tau_strict_min) AS INTEGER) AS tau_strict_min,
+                  SUM(b.tau_point_min * f.fill_factor) AS tau_fill_min,
+                  SUM(b.tau_strict_min + b.tau_point_min * f.fill_factor) AS tau_filled_min
+                FROM base b
+                JOIN factors f USING (uid64, day, is_weekend, "window")
+                {id_join}
+                GROUP BY b.h3_int, b."window", b.is_weekend{group_extra}
+              ) agg
+            ) TO '{_as_posix(out_path)}' (FORMAT PARQUET, CODEC ZSTD);
+            """
+        )
+
+        qa["output_rows"] = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{_as_posix(out_path)}')").fetchone()[0])
+        qa["n_users_uid64"] = int(con.execute("SELECT COUNT(DISTINCT uid64) FROM factors").fetchone()[0])
+        qa["n_user_day_windows"] = int(con.execute("SELECT COUNT(*) FROM factors").fetchone()[0])
+        qa["n_user_day_windows_no_points"] = int(con.execute("SELECT COUNT(*) FROM factors WHERE point_sum_min=0").fetchone()[0])
+        qa["n_user_day_windows_no_strict"] = int(con.execute("SELECT COUNT(*) FROM factors WHERE strict_sum_min=0").fetchone()[0])
+        qa["output_parquet_bytes"] = int(out_path.stat().st_size)
+        qa["output_parquet_mb"] = round(qa["output_parquet_bytes"] / 1024 / 1024, 3)
+
+        win_stats = con.execute(
+            """
+            SELECT
+              "window" AS window,
+              COUNT(*) AS n_user_day_windows,
+              SUM(strict_sum_min) AS strict_sum_total_min,
+              SUM(point_sum_min) AS point_sum_total_min,
+              SUM(missing_min) AS missing_total_min,
+              AVG(fill_factor) AS fill_factor_mean,
+              quantile_cont(fill_factor, 0.5) AS fill_factor_p50,
+              quantile_cont(fill_factor, 0.9) AS fill_factor_p90,
+              quantile_cont(fill_factor, 0.99) AS fill_factor_p99,
+              quantile_cont(missing_min, 0.5) AS missing_p50,
+              quantile_cont(missing_min, 0.9) AS missing_p90,
+              quantile_cont(missing_min, 0.99) AS missing_p99
+            FROM factors
+            GROUP BY "window"
+            """
+        ).fetchdf()
+        for _, r in win_stats.iterrows():
+            w = str(r["window"])
+            qa[f"{w}__n_user_day_windows"] = int(r["n_user_day_windows"])
+            qa[f"{w}__strict_sum_total_min"] = float(r["strict_sum_total_min"])
+            qa[f"{w}__point_sum_total_min"] = float(r["point_sum_total_min"])
+            qa[f"{w}__missing_total_min"] = float(r["missing_total_min"])
+            qa[f"{w}__fill_factor_mean"] = float(r["fill_factor_mean"])
+            qa[f"{w}__fill_factor_p50"] = float(r["fill_factor_p50"])
+            qa[f"{w}__fill_factor_p90"] = float(r["fill_factor_p90"])
+            qa[f"{w}__fill_factor_p99"] = float(r["fill_factor_p99"])
+            qa[f"{w}__missing_p50"] = float(r["missing_p50"])
+            qa[f"{w}__missing_p90"] = float(r["missing_p90"])
+            qa[f"{w}__missing_p99"] = float(r["missing_p99"])
+
+        con.execute(
+            f"""
+            CREATE VIEW point_gap AS
+            WITH diffs AS (
+              SELECT
+                uid64,
+                day,
+                "window" AS window,
+                MIN(t_ms) AS first_t,
+                MAX(t_ms) AS last_t,
+                MAX(t_ms - prev_t) AS max_diff
+              FROM (
+                SELECT
+                  uid64,
+                  day,
+                  "window" AS window,
+                  t_ms,
+                  LAG(t_ms) OVER (PARTITION BY uid64, day, "window" ORDER BY t_ms) AS prev_t
+                FROM point_valid
+              ) o
+              GROUP BY uid64, day, "window"
+            )
+            SELECT
+              d.uid64,
+              d.day,
+              d."window" AS window,
+              GREATEST(
+                COALESCE(d.max_diff, 0),
+                COALESCE(d.first_t - (d.day::BIGINT*{MS_PER_DAY} + m.start_mod_ms), 0),
+                COALESCE((d.day::BIGINT*{MS_PER_DAY} + m.end_mod_ms) - d.last_t, 0)
+              )::DOUBLE / {MS_PER_MIN} AS point_max_gap_min
+            FROM diffs d
+            JOIN window_meta m USING ("window")
+            """
+        )
+        gap_stats = con.execute(
+            """
+            SELECT
+              f."window" AS window,
+              quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.5) AS point_max_gap_p50,
+              quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.9) AS point_max_gap_p90,
+              quantile_cont(COALESCE(g.point_max_gap_min, f.win_len_min), 0.99) AS point_max_gap_p99
+            FROM factors f
+            LEFT JOIN point_gap g USING (uid64, day, "window")
+            GROUP BY f."window"
+            """
+        ).fetchdf()
+        for _, r in gap_stats.iterrows():
+            w = str(r["window"])
+            qa[f"{w}__point_max_gap_p50"] = float(r["point_max_gap_p50"])
+            qa[f"{w}__point_max_gap_p90"] = float(r["point_max_gap_p90"])
+            qa[f"{w}__point_max_gap_p99"] = float(r["point_max_gap_p99"])
+
+    pd.DataFrame([qa]).to_csv(qa_path, index=False, encoding="utf-8-sig")
+    log(f"Wrote: {out_path}")
+    log(f"Wrote: {qa_path}")
+
+    if not keep_intermediate:
+        with _step(log, "Cleanup intermediate parts"):
+            for d in [interval_parts_dir, point_parts_dir]:
+                if not d.exists():
+                    continue
+                try:
+                    shutil.rmtree(d)
+                except Exception as e:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup = d.with_name(f"{d.name}_old_{ts}")
+                    i = 0
+                    while backup.exists():
+                        i += 1
+                        backup = d.with_name(f"{d.name}_old_{ts}_{i}")
+                    try:
+                        d.rename(backup)
+                        log(f"WARN: failed to delete {d} ({e}); renamed to {backup} instead.")
+                    except Exception:
+                        log(f"WARN: failed to delete {d}: {e}")
+
+    log("Done.")
+    log("=" * 70)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Export user×H3-hex lunch/dinner weights with strict/fill/filled scheme")
+    p.add_argument("--city", required=True)
+    p.add_argument("--staypoints", required=True, nargs="+", help="Parquet/CSV path(s) or glob(s)")
+    p.add_argument("--staypoints_format", default="auto", choices=["auto", "parquet", "csv"])
+    p.add_argument("--uuid_table", default=None, help="Optional uuid table (.parquet or .csv) for whitelist filtering")
+    p.add_argument("--hex_meta", required=True, help="hex_meta_<city>_<code>.json (top-level dict)")
+    p.add_argument("--out_dir", required=True)
+    p.add_argument("--tmp_root", default=None, help="Optional intermediate tmp root (recommended on Colab: /tmp)")
+
+    p.add_argument("--schema_map", default=None, help="JSON string or path to JSON file")
+    p.add_argument("--output_hex_uid", type=_str2bool, default=True, help="If true, output string hex_uid")
+    p.add_argument("--output_h3_id", type=_str2bool, default=True, help="If true, output string h3_id (lower hex)")
+    p.add_argument("--output_h3_int", type=_str2bool, default=False, help="If true, also output numeric h3_int (uint64)")
+    p.add_argument("--hex_uid_code", default=None, help="City code used in hex_uid (e.g. 440300); defaults to hex_meta.code or --city")
+    p.add_argument("--hex_uid_prefix", default="hex", help="Prefix used in hex_uid (default: hex)")
+    p.add_argument("--filter_city_code", type=_str2bool, default=False, help="If true, pre-filter staypoints by city code column (e.g. c_code)")
+    p.add_argument("--city_code_col", default=None, help="Staypoints city code column name (default: infer, e.g. c_code)")
+    p.add_argument("--city_code_value", default=None, help="City code value to filter (default: --hex_uid_code or hex_meta.code)")
+    p.add_argument("--windows", default="lunch,dinner", help="Comma-separated: lunch,dinner")
+    p.add_argument("--min_interval_minutes", type=int, default=5)
+    p.add_argument("--point_source_filter", type=_str2bool, default=True)
+    p.add_argument("--point_source_value", default="cell_appearance")
+    p.add_argument("--drop_uuid_not_in_table", type=_str2bool, default=False)
+
+    p.add_argument("--timestamps_are_utc", type=_str2bool, default=True)
+    p.add_argument("--tz_offset_hours", type=int, default=8)
+    p.add_argument("--epoch_unit", default="ms", choices=["ms", "s"])
+
+    p.add_argument(
+        "--uid64_hash_method",
+        default="sha256_64",
+        choices=["sha256_64", "md5_64", "pandas_64", "xxh64"],
+        help="Stable 64-bit uid hash method (xxh64 is fastest if available)",
+    )
+    p.add_argument("--id_mode", default="uuid", choices=["uuid", "uid64", "both"])
+
+    p.add_argument("--buckets", type=int, default=256, help="(reserved) future stage-2 bucketing")
+    p.add_argument("--batch_size", type=int, default=1_000_000)
+    p.add_argument("--log_every_batches", type=int, default=500, help="Log progress every N batches (0 disables)")
+    p.add_argument("--overlap_rounding", default="floor", choices=["floor", "round", "ceil"])
+    p.add_argument("--oob_mode", default="drop", choices=["drop", "null", "keep"])
+
+    p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--memory_limit", default="16GB")
+    p.add_argument(
+        "--duckdb_temp_dir",
+        default=None,
+        help="Optional DuckDB temp directory (for spills); default is <out_dir>/<city>/_tmp_hex_strict_filled/duckdb_tmp",
+    )
+    p.add_argument(
+        "--resume_stage2",
+        type=_str2bool,
+        default=False,
+        help="If true, skip Stage-1 scan and reuse existing _tmp_hex_strict_filled parts",
+    )
+    p.add_argument("--keep_intermediate", type=_str2bool, default=False)
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    schema_map = _load_json_arg(args.schema_map)
+
+    staypoints = _resolve_input_paths(args.staypoints)
+    if not staypoints:
+        raise SystemExit("No staypoints files found.")
+
+    uuid_table = Path(args.uuid_table).resolve() if args.uuid_table else None
+    hex_meta_path = Path(args.hex_meta).resolve()
+    out_dir = Path(args.out_dir).resolve()
+    tmp_root = Path(args.tmp_root).resolve() if args.tmp_root else None
+    duckdb_temp_dir = Path(args.duckdb_temp_dir).resolve() if args.duckdb_temp_dir else None
+
+    windows = [w.strip() for w in args.windows.split(",") if w.strip()]
+
+    export_user_hex_time_strict_filled(
+        city=args.city,
+        staypoints=staypoints,
+        staypoints_format=args.staypoints_format,
+        uuid_table=uuid_table,
+        hex_meta_path=hex_meta_path,
+        out_dir=out_dir,
+        tmp_root=tmp_root,
+        schema_map=schema_map,
+        output_hex_uid=args.output_hex_uid,
+        output_h3_id=args.output_h3_id,
+        output_h3_int=args.output_h3_int,
+        hex_uid_code=args.hex_uid_code,
+        hex_uid_prefix=args.hex_uid_prefix,
+        filter_city_code=args.filter_city_code,
+        city_code_col=args.city_code_col,
+        city_code_value=args.city_code_value,
+        windows=windows,
+        min_interval_minutes=args.min_interval_minutes,
+        point_source_filter=args.point_source_filter,
+        point_source_value=args.point_source_value,
+        drop_uuid_not_in_table=args.drop_uuid_not_in_table,
+        timestamps_are_utc=args.timestamps_are_utc,
+        tz_offset_hours=args.tz_offset_hours,
+        epoch_unit=args.epoch_unit,
+        uid64_hash_method=args.uid64_hash_method,
+        buckets=args.buckets,
+        batch_size=args.batch_size,
+        log_every_batches=args.log_every_batches,
+        overlap_rounding=args.overlap_rounding,
+        oob_mode=args.oob_mode,
+        threads=args.threads,
+        memory_limit=args.memory_limit,
+        duckdb_temp_dir=duckdb_temp_dir,
+        id_mode=args.id_mode,
+        resume_stage2=args.resume_stage2,
+        keep_intermediate=args.keep_intermediate,
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

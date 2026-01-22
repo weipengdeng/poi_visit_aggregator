@@ -138,5 +138,40 @@ Outputs:
 
 Demo notebook (Colab / local): `notebooks/Shenzhen_exposure_weight_demo.ipynb`.
 
+## Remote export: user_hex_time (strict/fill/filled)
+
+This exporter uses **H3 hex cells** as the spatial unit, driven by a city meta JSON like
+`hex_meta_Shenzhen_440300.json` (top-level dict with `h3_resolution` + `h3_ids`).
+
+Install with optional deps:
+
+```bash
+pip install -e ".[export]"
+```
+
+Run:
+
+```bash
+python -m poi_visit_aggregator.export_user_hex_time_strict_filled ^
+  --city shenzhen ^
+  --staypoints "D:\\data\\staypoints_*.csv" ^
+  --uuid_table "D:\\data\\uuid_table.parquet" ^
+  --hex_meta "D:\\data\\hex_meta_Shenzhen_440300.json" ^
+  --out_dir "D:\\out" ^
+  --tmp_root "D:\\tmp\\poi_visit_tmp" ^
+  --drop_uuid_not_in_table true ^
+  --hex_uid_code 440300 ^
+  --filter_city_code true ^
+  --city_code_col c_code ^
+  --duckdb_temp_dir "D:\\tmp\\duckdb_tmp" ^
+  --resume_stage2 false ^
+  --id_mode uuid ^
+  --windows lunch,dinner
+```
+
+Outputs:
+- `<out_dir>/<city>/user_hex_time_strict_filled_<city>.parquet` (columns include `hex_uid`, `h3_id`, `window`, `is_weekend`, `tau_strict_min`, `tau_fill_min`, `tau_filled_min`, and optional `h3_int`, `uuid`, `uid64`)
+- `<out_dir>/<city>/qa_summary_hex_strict_filled_<city>.csv`
+
 ## License
 This project is licensed under the Apache License 2.0.

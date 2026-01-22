@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 export = [
   "duckdb>=0.9",
+  "h3>=4.0",
   "pyproj>=3.5",
   "xxhash>=3.0",
 ]
