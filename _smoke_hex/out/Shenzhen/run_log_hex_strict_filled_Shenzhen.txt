@@ -1,0 +1,20 @@
+[2026-01-22 15:48:29] Start export_user_hex_time_strict_filled city='Shenzhen'
+[2026-01-22 15:48:29] hex_meta_path=E:/OneDrive/Git/poi_visit_aggregator/hex_meta_Shenzhen_440300.json
+[2026-01-22 15:48:29] id_mode=uuid, uid64_hash_method=sha256_64, store_uuid=True, store_uid64=False
+[2026-01-22 15:48:29] hex_meta loaded: city='Shenzhen_440300', code='440300', h3_resolution=9, n_hexes=14,176
+[2026-01-22 15:48:29] Loaded city hex set: 14,176 cells
+[2026-01-22 15:48:29] [START] Open dataset (csv) (RAM=116 MB)
+[2026-01-22 15:48:29] [ END ] Open dataset (csv) (dt=0.0s, RAM=121 MB, Δ=5 MB)
+[2026-01-22 15:48:29] Staypoints scan columns: ['uuid', 'start_time', 'end_time', 'source', 'lon', 'lat']
+[2026-01-22 15:48:29] [START] Reset intermediate parts dirs (RAM=122 MB)
+[2026-01-22 15:48:29] [ END ] Reset intermediate parts dirs (dt=0.0s, RAM=122 MB, Δ=0 MB)
+[2026-01-22 15:48:29] [START] Stage-1 scan + write parts (RAM=122 MB)
+[2026-01-22 15:48:29] [ END ] Stage-1 scan + write parts (dt=0.0s, RAM=125 MB, Δ=3 MB)
+[2026-01-22 15:48:29] [START] Stage-2 DuckDB (midpoint split + strict/fill aggregation) (RAM=125 MB)
+[2026-01-22 15:48:29] [ END ] Stage-2 DuckDB (midpoint split + strict/fill aggregation) (dt=0.1s, RAM=136 MB, Δ=11 MB)
+[2026-01-22 15:48:29] Wrote: E:\OneDrive\Git\poi_visit_aggregator\_smoke_hex\out\Shenzhen\user_hex_time_strict_filled_Shenzhen.parquet
+[2026-01-22 15:48:29] Wrote: E:\OneDrive\Git\poi_visit_aggregator\_smoke_hex\out\Shenzhen\qa_summary_hex_strict_filled_Shenzhen.csv
+[2026-01-22 15:48:29] [START] Cleanup intermediate parts (RAM=136 MB)
+[2026-01-22 15:48:29] [ END ] Cleanup intermediate parts (dt=0.0s, RAM=136 MB, Δ=0 MB)
+[2026-01-22 15:48:29] Done.
+[2026-01-22 15:48:29] ======================================================================
